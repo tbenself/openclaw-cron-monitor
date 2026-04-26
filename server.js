@@ -512,7 +512,7 @@ function sampleData() {
     kind: "sample",
     state: {
       "morning-brief": { nextRunAt: isoAt(7, 0, 1), lastStatus: "succeeded" },
-      "github-sweep": { nextRunAt: isoAt(9, 30, 0), lastStatus: "running", running: true },
+      "github-sweep": { nextRunAt: isoAt(13, 30, 0), lastStatus: "running", running: true },
       "photos-backup": { nextRunAt: isoAt(2, 0, 1), lastStatus: "failed" },
     },
     jobs: [
@@ -535,7 +535,7 @@ function sampleData() {
       {
         jobId: "github-sweep",
         name: "GitHub Sweep",
-        schedule: { kind: "cron", expr: "*/30 * * * *", tz: "America/New_York", staggerMs: 120000 },
+        schedule: { kind: "cron", expr: "30 9,13,17 * * 1-5", tz: "America/New_York", staggerMs: 120000 },
         sessionTarget: "session:github-ops",
         payload: {
           kind: "agentTurn",
@@ -589,7 +589,7 @@ const sampleRuns = {
       jobId: "github-sweep",
       status: "running",
       exitCode: null,
-      startedAt: isoAt(9, 30, 0),
+      startedAt: isoAt(13, 30, 0),
       endedAt: null,
       durationMs: null,
       summary: "Scanning GitHub notifications.",

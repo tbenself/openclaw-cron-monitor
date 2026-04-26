@@ -14,7 +14,6 @@
     "README.md",
     "LICENSE",
     "openclaw.plugin.json",
-    ".codex-plugin/plugin.json",
     "assets/"
   ],
   "scripts": {

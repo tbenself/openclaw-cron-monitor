@@ -1,0 +1,55 @@
+{
+  "name": "openclaw-cron-monitor",
+  "version": "0.1.0",
+  "description": "Read-only web dashboard for OpenClaw cron jobs and recurring task runs.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "openclaw-cron-monitor": "./server.js"
+  },
+  "files": [
+    "server.js",
+    "extensions/",
+    "public/",
+    "README.md",
+    "LICENSE",
+    "openclaw.plugin.json",
+    ".codex-plugin/plugin.json",
+    "assets/"
+  ],
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "check": "node --check server.js && node --check public/app.js"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "openclaw": {
+    "extensions": [
+      "./extensions/openclaw-cron-monitor.ts"
+    ],
+    "web": {
+      "command": "openclaw-cron-monitor",
+      "defaultPort": 3817
+    },
+    "readOnly": true
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "keywords": [
+    "pi-package",
+    "openclaw",
+    "cron",
+    "monitoring",
+    "recurring-tasks",
+    "dashboard"
+  ]
+}

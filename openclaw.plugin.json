@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "name": "openclaw-cron-monitor",
+  "version": "0.1.0",
+  "displayName": "OpenClaw Cron Monitor",
+  "description": "Read-only dashboard and tools for OpenClaw cron jobs and recurring task runs.",
+  "entry": "./extensions/openclaw-cron-monitor.ts",
+  "web": {
+    "command": "openclaw-cron-monitor",
+    "defaultPort": 3817
+  },
+  "permissions": {
+    "filesystem": {
+      "read": [
+        "~/.openclaw/cron/jobs.json",
+        "~/.openclaw/cron/jobs-state.json",
+        "~/.openclaw/cron/runs/*.jsonl"
+      ],
+      "write": []
+    },
+    "network": {
+      "listen": true,
+      "outbound": false
+    }
+  },
+  "readOnly": true
+}

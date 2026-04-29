@@ -166,6 +166,7 @@ button {
 }
 
 .health-row,
+.owner-row,
 .job-row,
 .meta-row,
 .history-row {
@@ -195,6 +196,52 @@ button {
   display: inline-flex;
   align-items: center;
   gap: 8px;
+}
+
+.owner-list {
+  display: grid;
+  gap: 7px;
+}
+
+.owner-row {
+  width: 100%;
+  min-height: 42px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 7px 9px;
+  background: var(--panel);
+  cursor: pointer;
+  text-align: left;
+}
+
+.owner-row:hover,
+.owner-row.selected {
+  border-color: var(--blue);
+  background: var(--blue-soft);
+}
+
+.owner-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.owner-name,
+.owner-subtitle,
+.job-subtitle {
+  display: block;
+}
+
+.owner-name {
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.owner-subtitle {
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 11px;
 }
 
 .count {
@@ -375,6 +422,11 @@ button {
   display: grid;
   grid-template-columns: 54px repeat(7, minmax(72px, 1fr));
   min-height: 1440px;
+}
+
+.today-calendar .days,
+.today-calendar .grid {
+  grid-template-columns: 54px minmax(0, 1fr);
 }
 
 .time-col {

@@ -79,10 +79,16 @@ Defaults:
 Example:
 
 ```bash
-OPENCLAW_MONITOR_NETWORK_LABEL="Private network" OPENCLAW_MONITOR_HOST_LABEL="cron-host" HOST=0.0.0.0 PORT=3817 openclaw-cron-monitor
+OPENCLAW_MONITOR_NETWORK_LABEL="Tailscale Serve" OPENCLAW_MONITOR_HOST_LABEL="cron-host" HOST=127.0.0.1 PORT=3817 openclaw-cron-monitor
 ```
 
-Use `HOST=127.0.0.1` for same-machine access or SSH tunnels. Use `HOST=0.0.0.0` only when you intentionally want other machines on a trusted network to reach the dashboard.
+Keep `HOST=127.0.0.1` for the dashboard process unless you have a specific reason to bind elsewhere. For access from other trusted devices, put the localhost service behind a private-network proxy such as Tailscale Serve:
+
+```bash
+tailscale serve --http=3817 127.0.0.1:3817
+```
+
+This keeps the unauthenticated read-only dashboard off the general LAN while still making it reachable to devices signed into your tailnet. If you choose a direct bind instead, prefer the host's Tailscale IP over `0.0.0.0`.
 
 ## Registry Checklist
 
@@ -98,4 +104,4 @@ Before publishing:
 
 The package contains no cron job data, run logs, hostnames, private network addresses, or user-specific paths. Runtime data is read from the machine where the monitor is installed and is only served by the local process you start.
 
-For private-network deployments, bind the service only where you intend it to be reachable and use your firewall, VPN, or private-network access controls to limit access.
+For private-network deployments, keep the monitor bound to `127.0.0.1` and expose it through Tailscale Serve, an SSH tunnel, or another authenticated private-network proxy. Avoid binding the monitor to `0.0.0.0` unless you have also added access control in front of it.

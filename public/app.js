@@ -6,6 +6,7 @@ let selectedTab = "summary";
 let selectedRunId = null;
 let searchTerm = "";
 let statusFilter = "all";
+let ownerFilter = "all";
 let viewMode = "week";
 let logStream = "stderr";
 
@@ -28,6 +29,7 @@ async function refresh() {
 }
 
 function render() {
+  const focus = captureFocus();
   const job = selectedJob();
   const visibleJobs = filteredJobs();
   const visibleJobIds = new Set(visibleJobs.map((item) => item.id));
@@ -56,6 +58,7 @@ function render() {
     </div>
   `;
   bindEvents();
+  restoreFocus(focus);
 }
 
 function renderTopbar() {
@@ -74,16 +77,24 @@ function renderTopbar() {
 }
 
 function renderSidebar() {
+  const scoped = scopedJobs();
+  const counts = countStatuses(scoped);
   return `
     <aside class="sidebar">
       <h3 class="section-title">Health</h3>
       <div class="health-grid">
-        ${healthRow("All", "all", data.counts.total)}
-        ${healthRow("Running", "running", data.counts.running)}
-        ${healthRow("Succeeded", "succeeded", data.counts.succeeded)}
-        ${healthRow("Failed", "failed", data.counts.failed)}
-        ${healthRow("Skipped", "skipped", data.counts.skipped)}
-        ${healthRow("Unknown", "unknown", data.counts.unknown)}
+        ${healthRow("All", "all", counts.total)}
+        ${healthRow("Running", "running", counts.running)}
+        ${healthRow("Succeeded", "succeeded", counts.succeeded)}
+        ${healthRow("Failed", "failed", counts.failed)}
+        ${healthRow("Skipped", "skipped", counts.skipped)}
+        ${healthRow("Unknown", "unknown", counts.unknown)}
+      </div>
+      <div class="sidebar-block">
+        <h3 class="section-title">Owner / Session</h3>
+        <div class="owner-list">
+          ${ownerFilters().map(renderOwnerRow).join("")}
+        </div>
       </div>
       <div class="sidebar-block">
         <h3 class="section-title">Jobs</h3>
@@ -99,6 +110,21 @@ function renderSidebar() {
   `;
 }
 
+function renderOwnerRow(owner) {
+  return `
+    <button class="owner-row ${ownerFilter === owner.key ? "selected" : ""}" data-owner-filter="${escapeAttr(owner.key)}">
+      <span class="owner-main">
+        <span class="dot ${owner.status}"></span>
+        <span>
+          <span class="owner-name">${escapeHtml(owner.label)}</span>
+          <span class="owner-subtitle">${escapeHtml(owner.detail)}</span>
+        </span>
+      </span>
+      <span class="count">${owner.count}</span>
+    </button>
+  `;
+}
+
 function healthRow(label, status, count) {
   return `
     <button class="health-row ${statusFilter === status ? "selected" : ""}" data-status-filter="${status}">
@@ -109,11 +135,12 @@ function healthRow(label, status, count) {
 }
 
 function renderJobRow(job) {
+  const owner = jobOwner(job);
   return `
     <button class="job-row ${job.id === selectedJobId ? "selected" : ""}" data-job-id="${escapeAttr(job.id)}">
       <span>
         <span class="job-name"><span class="dot ${job.status}"></span>${escapeHtml(job.name)}</span>
-        <span class="job-subtitle">${escapeHtml(formatSchedule(job.schedule))}</span>
+        <span class="job-subtitle">${escapeHtml(formatSchedule(job.schedule))} · ${escapeHtml(owner.label)}</span>
       </span>
       <span class="pill ${job.status}">${escapeHtml(job.status)}</span>
     </button>
@@ -123,8 +150,9 @@ function renderJobRow(job) {
 function renderCalendar(events) {
   const days = viewMode === "today" ? [today()] : weekDays();
   const hours = Array.from({ length: 24 }, (_, index) => index);
+  const modeClass = viewMode === "today" ? "today-calendar" : "week-calendar";
   return `
-    <section class="calendar">
+    <section class="calendar ${modeClass}">
       <div class="days">
         <div></div>
         ${days.map((day) => `
@@ -246,6 +274,7 @@ function renderTab(job, run) {
         ${renderMetaGrid([
           ["Likely cause", diagnosis.cause],
           ["Last successful run", formatDateTime(job.recentRuns.find((item) => item.status === "succeeded")?.startedAt)],
+          ["Owner / session", jobOwner(job).label],
           ["Delivery", formatDeliveryStatus(run, job)],
           ["Reports", formatDelivery(job)],
           ["Timeout", formatTimeout(job.payload.timeoutSeconds)],
@@ -272,6 +301,7 @@ function renderTab(job, run) {
         </div>
         ${renderMetaGrid([
           ["Schedule", `${formatSchedule(job.schedule)} · ${job.schedule.tz || "host time"}`],
+          ["Owner / session", jobOwner(job).label],
           ["Session", `${job.sessionTarget} · ${job.sessionKey}`],
           ["Payload", job.payload.kind],
           ["Timeout", formatTimeout(job.payload.timeoutSeconds)],
@@ -290,6 +320,7 @@ function renderTab(job, run) {
           <div class="copy">Gateway scheduler execution. Each run creates a background task and writes to the OpenClaw cron run log.</div>
         </div>
         ${renderMetaGrid([
+          ["Owner / session", jobOwner(job).label],
           ["Session", `${job.sessionTarget} · ${job.sessionKey}`],
           ["Payload", job.payload.kind],
           ["Reports", formatDelivery(job)],
@@ -378,6 +409,7 @@ function bindEvents() {
   document.querySelector('[data-action="home"]')?.addEventListener("click", () => {
     searchTerm = "";
     statusFilter = "all";
+    ownerFilter = "all";
     viewMode = "week";
     selectedTab = "summary";
     selectedJobId = data.jobs.find((job) => job.status === "failed")?.id || data.jobs[0]?.id || null;
@@ -415,6 +447,14 @@ function bindEvents() {
   document.querySelectorAll("[data-status-filter]").forEach((element) => {
     element.addEventListener("click", () => {
       statusFilter = element.dataset.statusFilter || "all";
+      keepSelectionVisible();
+      render();
+    });
+  });
+  document.querySelectorAll("[data-owner-filter]").forEach((element) => {
+    element.addEventListener("click", () => {
+      ownerFilter = element.dataset.ownerFilter || "all";
+      statusFilter = "all";
       keepSelectionVisible();
       render();
     });
@@ -594,16 +634,24 @@ function isConstraintLine(value) {
 }
 
 function filteredJobs() {
+  return scopedJobs().filter((job) => statusFilter === "all" || job.status === statusFilter);
+}
+
+function scopedJobs() {
   const query = searchTerm.trim().toLowerCase();
   return data.jobs.filter((job) => {
-    const matchesStatus = statusFilter === "all" || job.status === statusFilter;
+    const owner = jobOwner(job);
+    const matchesOwner = ownerFilter === "all" || owner.key === ownerFilter;
     const haystack = [
       job.name,
       job.id,
+      owner.label,
+      owner.key,
       job.schedule?.expr,
       job.schedule?.tz,
       job.sessionTarget,
       job.sessionKey,
+      job.agentId,
       job.payload?.message,
       job.delivery?.mode,
       job.delivery?.channel,
@@ -612,8 +660,89 @@ function filteredJobs() {
       .filter(Boolean)
       .join(" ")
       .toLowerCase();
-    return matchesStatus && (!query || haystack.includes(query));
+    return matchesOwner && (!query || haystack.includes(query));
   });
+}
+
+function ownerFilters() {
+  const groups = new Map();
+  data.jobs.forEach((job) => {
+    const owner = jobOwner(job);
+    if (!groups.has(owner.key)) {
+      groups.set(owner.key, { key: owner.key, label: owner.label, jobs: [] });
+    }
+    groups.get(owner.key).jobs.push(job);
+  });
+
+  const owners = [...groups.values()]
+    .map((owner) => ({ ...owner, ...ownerSummary(owner.jobs) }))
+    .sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
+
+  return [
+    {
+      key: "all",
+      label: "All owners",
+      ...ownerSummary(data.jobs),
+    },
+    ...owners,
+  ];
+}
+
+function ownerSummary(jobs) {
+  const counts = countStatuses(jobs);
+  const status = counts.failed ? "failed" : counts.running ? "running" : counts.unknown ? "unknown" : counts.succeeded ? "succeeded" : "skipped";
+  const detailParts = [`${counts.total} ${pluralize("job", counts.total)}`];
+  if (counts.failed) detailParts.push(`${counts.failed} failed`);
+  if (counts.running) detailParts.push(`${counts.running} running`);
+  return {
+    count: counts.total,
+    status,
+    detail: detailParts.join(" · "),
+  };
+}
+
+function countStatuses(jobs) {
+  return jobs.reduce(
+    (counts, job) => {
+      const status = job.status || "unknown";
+      counts.total += 1;
+      counts[status] = (counts[status] || 0) + 1;
+      return counts;
+    },
+    { total: 0, running: 0, succeeded: 0, failed: 0, skipped: 0, unknown: 0 },
+  );
+}
+
+function jobOwner(job) {
+  if (job.agentId) {
+    return { key: `agent:${job.agentId}`, label: `Agent: ${cleanOwnerLabel(job.agentId)}` };
+  }
+
+  if (job.sessionTarget && job.sessionTarget !== "isolated") {
+    return { key: `session:${job.sessionTarget}`, label: cleanOwnerLabel(job.sessionTarget) };
+  }
+
+  if (job.sessionKey && !String(job.sessionKey).startsWith("cron:")) {
+    return { key: `session:${job.sessionKey}`, label: cleanOwnerLabel(job.sessionKey) };
+  }
+
+  return { key: "isolated", label: "Isolated cron" };
+}
+
+function cleanOwnerLabel(value) {
+  const label = String(value || "Unknown")
+    .replace(/^session:/, "")
+    .replace(/^agent:/, "")
+    .replace(/[-_]+/g, " ")
+    .trim();
+  return label
+    .split(/\s+/)
+    .map((word) => word ? word.charAt(0).toUpperCase() + word.slice(1) : word)
+    .join(" ");
+}
+
+function pluralize(word, count) {
+  return count === 1 ? word : `${word}s`;
 }
 
 function keepSelectionVisible() {
@@ -621,6 +750,26 @@ function keepSelectionVisible() {
   if (!jobs.some((job) => job.id === selectedJobId)) {
     selectedJobId = jobs[0]?.id || data.jobs[0]?.id || null;
     selectedRunId = selectedJob()?.lastRun?.id || null;
+  }
+}
+
+function captureFocus() {
+  const active = document.activeElement;
+  if (!active?.matches?.("[data-search]")) return null;
+  return {
+    target: "search",
+    start: active.selectionStart,
+    end: active.selectionEnd,
+  };
+}
+
+function restoreFocus(focus) {
+  if (focus?.target !== "search") return;
+  const input = document.querySelector("[data-search]");
+  if (!input) return;
+  input.focus({ preventScroll: true });
+  if (Number.isInteger(focus.start) && Number.isInteger(focus.end)) {
+    input.setSelectionRange(focus.start, focus.end);
   }
 }
 

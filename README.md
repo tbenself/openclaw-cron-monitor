@@ -6,6 +6,14 @@ The monitor reads local OpenClaw cron files, projects upcoming cron occurrences 
 
 ![OpenClaw Cron Monitor sample screenshot](./assets/screenshot-sample.png)
 
+## Recent Changes
+
+- Added an Owner / Session filter so jobs can be scoped by bot, session, or isolated cron ownership.
+- Health counts, the job list, the calendar, and the runs table now update together when owner, status, or search filters are active.
+- Fixed the Today calendar view so it renders as a full-width single day instead of a narrow week column.
+- Fixed search focus retention so typing a full search term does not require re-clicking the search box after each letter.
+- Updated deployment guidance to keep the dashboard bound to `127.0.0.1` and expose remote access through Tailscale Serve, SSH tunnels, or another authenticated private-network proxy.
+
 ## Install The Web Dashboard
 
 ```bash

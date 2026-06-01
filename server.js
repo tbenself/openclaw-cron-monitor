@@ -12,6 +12,7 @@ const port = Number(process.env.PORT || 3817);
 const host = process.env.HOST || "127.0.0.1";
 const networkLabel = process.env.OPENCLAW_MONITOR_NETWORK_LABEL || "Private network";
 const hostLabel = process.env.OPENCLAW_MONITOR_HOST_LABEL || os.hostname();
+const analyticsWindowDays = Number(process.env.OPENCLAW_MONITOR_ANALYTICS_DAYS || 14);
 
 const cronDir = expandHome(process.env.OPENCLAW_CRON_DIR || "~/.openclaw/cron");
 const jobsPath = process.env.OPENCLAW_JOBS_PATH || path.join(cronDir, "jobs.json");
@@ -72,17 +73,20 @@ function isDirectRun() {
 
 export async function loadOverview() {
   const source = await loadOpenClawData();
+  const analyticsWindowStart = Date.now() - analyticsWindowDays * 24 * 60 * 60 * 1000;
   const jobs = source.jobs.map((job) => normalizeJob(job, source.state));
   const jobsWithRuns = await Promise.all(
     jobs.map(async (job) => {
-      const runs = await loadRuns(job.id, 20);
+      const runs = await loadRuns(job.id, 250);
       const lastRun = runs[0] || null;
+      const analytics = jobAnalytics(job, runs, analyticsWindowStart);
       return {
         ...job,
         status: deriveJobStatus(job, source.state?.[job.id], lastRun),
         typicalDurationMs: typicalDurationMs(runs),
         lastRun,
-        recentRuns: runs.slice(0, 6),
+        recentRuns: runs.slice(0, 8),
+        analytics,
       };
     }),
   );
@@ -96,6 +100,7 @@ export async function loadOverview() {
     },
     { total: 0, running: 0, succeeded: 0, failed: 0, warning: 0, skipped: 0, unknown: 0 },
   );
+  const analytics = await buildOverviewAnalytics(jobsWithRuns, events, analyticsWindowStart);
 
   return {
     generatedAt: new Date().toISOString(),
@@ -106,6 +111,7 @@ export async function loadOverview() {
     jobs: jobsWithRuns,
     events,
     counts,
+    analytics,
   };
 }
 
@@ -239,6 +245,7 @@ function normalizeRun(run, jobId, index) {
   const endedAt = run.endedAt || run.endTime || run.completedAt || msToIso(addMs(run.runAtMs, run.durationMs)) || null;
   const durationMs = run.durationMs || calculateDurationMs(startedAt, endedAt);
   const stableTime = run.runAtMs || run.ts || Date.parse(startedAt || "") || index;
+  const deliveryStatus = run.deliveryStatus || (run.delivered === true ? "delivered" : run.delivered === false ? "not-delivered" : "");
   return {
     id: String(run.runId || run.id || `${jobId}-${stableTime}`),
     taskId: run.taskId || run.task?.id || "",
@@ -252,10 +259,12 @@ function normalizeRun(run, jobId, index) {
     stdout: run.stdout || run.logs?.stdout || run.result?.stdout || "",
     stderr: stringifyLog(run.stderr || run.logs?.stderr || run.error || run.result?.stderr || ""),
     delivery: run.delivery || {},
-    deliveryStatus: run.deliveryStatus || "",
+    deliveryStatus,
+    delivered: run.delivered ?? run.delivery?.delivered ?? null,
     sessionKey: run.sessionKey || "",
     model: run.model || "",
     provider: run.provider || "",
+    usage: normalizeUsage(run.usage),
     nextRunAt: msToIso(run.nextRunAtMs),
     raw: run,
   };
@@ -310,6 +319,303 @@ function typicalDurationMs(runs) {
     .sort((a, b) => a - b);
   if (!durations.length) return null;
   return durations[Math.floor(durations.length / 2)];
+}
+
+function jobAnalytics(job, runs, windowStartMs) {
+  const windowRuns = runs.filter((run) => runTimeMs(run) >= windowStartMs);
+  const successfulRuns = windowRuns.filter((run) => run.status === "succeeded");
+  const failedRuns = windowRuns.filter((run) => run.status === "failed");
+  const delivery = countBy(windowRuns, (run) => normalizeDeliveryBucket(run.deliveryStatus, job.delivery.mode));
+  const durations = numericValues(windowRuns.map((run) => run.durationMs)).sort((a, b) => a - b);
+  const usageRuns = windowRuns.filter((run) => run.usage?.totalTokens);
+  const totalTokens = usageRuns.reduce((sum, run) => sum + Number(run.usage.totalTokens || 0), 0);
+  const lastFailure = failedRuns[0] || null;
+  const timeoutMs = Number(job.payload.timeoutSeconds) > 0 ? Number(job.payload.timeoutSeconds) * 1000 : null;
+  const p90DurationMs = percentile(durations, 0.9);
+
+  return {
+    windowDays: analyticsWindowDays,
+    runs: windowRuns.length,
+    succeeded: successfulRuns.length,
+    failed: failedRuns.length,
+    successRate: windowRuns.length ? successfulRuns.length / windowRuns.length : null,
+    recovered: failedRuns.length > 0 && windowRuns[0]?.status === "succeeded",
+    noRuns: runs.length === 0,
+    stale: isStaleJob(job, runs[0]),
+    lastRunAt: runs[0]?.startedAt || null,
+    lastFailureAt: lastFailure?.startedAt || null,
+    lastFailureSummary: firstLine(lastFailure?.summary || lastFailure?.stderr || ""),
+    delivery,
+    durationMs: {
+      p50: percentile(durations, 0.5),
+      p90: p90DurationMs,
+      p99: percentile(durations, 0.99),
+      max: durations.length ? durations[durations.length - 1] : null,
+    },
+    usage: {
+      runs: usageRuns.length,
+      totalTokens,
+      avgTokens: usageRuns.length ? Math.round(totalTokens / usageRuns.length) : null,
+    },
+    timeoutRisk: Boolean(timeoutMs && p90DurationMs && p90DurationMs > timeoutMs * 0.8),
+  };
+}
+
+async function buildOverviewAnalytics(jobs, events, windowStartMs) {
+  const failures = jobs
+    .filter((job) => job.analytics.failed > 0)
+    .sort((a, b) => b.analytics.failed - a.analytics.failed || Date.parse(b.analytics.lastFailureAt || 0) - Date.parse(a.analytics.lastFailureAt || 0));
+  const recovered = jobs.filter((job) => job.analytics.recovered).sort((a, b) => Date.parse(b.analytics.lastFailureAt || 0) - Date.parse(a.analytics.lastFailureAt || 0));
+  const noRuns = jobs.filter((job) => job.analytics.noRuns);
+  const stale = jobs.filter((job) => job.analytics.stale);
+  const deliveryProblems = jobs
+    .map((job) => ({
+      id: job.id,
+      name: job.name,
+      owner: ownerKey(job),
+      notDelivered: job.analytics.delivery["not-delivered"] || 0,
+      unknown: job.analytics.delivery.unknown || 0,
+      delivered: job.analytics.delivery.delivered || 0,
+      mode: job.delivery.mode,
+    }))
+    .filter((item) => item.notDelivered || item.unknown)
+    .sort((a, b) => b.notDelivered - a.notDelivered || b.unknown - a.unknown);
+
+  const durationRows = jobs
+    .filter((job) => job.analytics.durationMs.p90)
+    .map((job) => ({
+      id: job.id,
+      name: job.name,
+      owner: ownerKey(job),
+      p90Ms: job.analytics.durationMs.p90,
+      maxMs: job.analytics.durationMs.max,
+      timeoutRisk: job.analytics.timeoutRisk,
+    }))
+    .sort((a, b) => b.p90Ms - a.p90Ms);
+
+  const usageRows = jobs
+    .filter((job) => job.analytics.usage.totalTokens)
+    .map((job) => ({
+      id: job.id,
+      name: job.name,
+      owner: ownerKey(job),
+      totalTokens: job.analytics.usage.totalTokens,
+      avgTokens: job.analytics.usage.avgTokens,
+    }))
+    .sort((a, b) => b.totalTokens - a.totalTokens);
+
+  const totalRuns = jobs.reduce((sum, job) => sum + job.analytics.runs, 0);
+  const totalSucceeded = jobs.reduce((sum, job) => sum + job.analytics.succeeded, 0);
+  const totalFailed = jobs.reduce((sum, job) => sum + job.analytics.failed, 0);
+  const deliveryCounts = mergeCounts(jobs.map((job) => job.analytics.delivery));
+  const durations = numericValues(jobs.flatMap((job) => [job.analytics.durationMs.p50, job.analytics.durationMs.p90, job.analytics.durationMs.p99, job.analytics.durationMs.max])).sort((a, b) => a - b);
+  const totalTokens = jobs.reduce((sum, job) => sum + job.analytics.usage.totalTokens, 0);
+
+  return {
+    windowDays: analyticsWindowDays,
+    totals: {
+      runs: totalRuns,
+      succeeded: totalSucceeded,
+      failed: totalFailed,
+      successRate: totalRuns ? totalSucceeded / totalRuns : null,
+      totalTokens,
+      avgTokens: totalRuns ? Math.round(totalTokens / totalRuns) : null,
+      durationMs: {
+        p50: percentile(durations, 0.5),
+        p90: percentile(durations, 0.9),
+        p99: percentile(durations, 0.99),
+        max: durations.length ? durations[durations.length - 1] : null,
+      },
+    },
+    delivery: deliveryCounts,
+    owners: ownerAnalytics(jobs),
+    reliability: {
+      failures: failures.slice(0, 12).map(jobSummary),
+      recovered: recovered.slice(0, 12).map(jobSummary),
+      noRuns: noRuns.slice(0, 12).map(jobSummary),
+      stale: stale.slice(0, 12).map(jobSummary),
+    },
+    deliveryProblems: deliveryProblems.slice(0, 12),
+    durationOutliers: durationRows.slice(0, 12),
+    usageOutliers: usageRows.slice(0, 12),
+    schedule: scheduleAnalytics(events),
+    archived: await archivedRunAnalytics(new Set(jobs.map((job) => job.id)), windowStartMs),
+  };
+}
+
+function ownerAnalytics(jobs) {
+  const owners = new Map();
+  jobs.forEach((job) => {
+    const key = ownerKey(job);
+    if (!owners.has(key)) {
+      owners.set(key, { key, label: ownerLabel(job), jobs: 0, runs: 0, failed: 0, recovered: 0, noRuns: 0, tokens: 0 });
+    }
+    const owner = owners.get(key);
+    owner.jobs += 1;
+    owner.runs += job.analytics.runs;
+    owner.failed += job.analytics.failed;
+    owner.recovered += job.analytics.recovered ? 1 : 0;
+    owner.noRuns += job.analytics.noRuns ? 1 : 0;
+    owner.tokens += job.analytics.usage.totalTokens;
+  });
+  return [...owners.values()].sort((a, b) => b.jobs - a.jobs || a.label.localeCompare(b.label));
+}
+
+function scheduleAnalytics(events) {
+  const upcoming = events.filter((event) => event.kind !== "run" && event.startedAt);
+  const byHour = Array.from({ length: 24 }, (_, hour) => ({ hour, count: 0 }));
+  const byDay = {};
+  upcoming.forEach((event) => {
+    const date = new Date(event.startedAt);
+    byHour[date.getHours()].count += 1;
+    const day = date.toISOString().slice(0, 10);
+    byDay[day] = (byDay[day] || 0) + 1;
+  });
+
+  const closeStarts = [];
+  const sorted = [...upcoming].sort((a, b) => Date.parse(a.startedAt) - Date.parse(b.startedAt));
+  for (let index = 1; index < sorted.length; index += 1) {
+    const previous = sorted[index - 1];
+    const current = sorted[index];
+    const gapMinutes = (Date.parse(current.startedAt) - Date.parse(previous.startedAt)) / 60000;
+    if (gapMinutes >= 0 && gapMinutes <= 5) {
+      closeStarts.push({
+        when: current.startedAt,
+        gapMinutes: Math.round(gapMinutes),
+        jobs: [previous.jobName, current.jobName],
+      });
+    }
+  }
+
+  return {
+    upcoming: upcoming.length,
+    byHour,
+    byDay: Object.entries(byDay).map(([day, count]) => ({ day, count })),
+    closeStarts: closeStarts.slice(0, 20),
+  };
+}
+
+async function archivedRunAnalytics(currentJobIds, windowStartMs) {
+  try {
+    const files = (await readdir(runsDir)).filter((file) => file.endsWith(".jsonl"));
+    const orphanIds = files.map((file) => file.replace(/\.jsonl$/, "")).filter((jobId) => !currentJobIds.has(jobId));
+    const orphanFailures = [];
+    for (const jobId of orphanIds.slice(0, 100)) {
+      const runs = await loadRuns(jobId, 100);
+      const failure = runs.find((run) => run.status === "failed" && runTimeMs(run) >= windowStartMs);
+      if (failure) {
+        orphanFailures.push({
+          id: jobId,
+          lastFailureAt: failure.startedAt,
+          summary: firstLine(failure.summary || failure.stderr || ""),
+        });
+      }
+    }
+    orphanFailures.sort((a, b) => Date.parse(b.lastFailureAt || 0) - Date.parse(a.lastFailureAt || 0));
+    return {
+      runFiles: files.length,
+      orphanRunFiles: orphanIds.length,
+      orphanRecentFailures: orphanFailures.slice(0, 10),
+    };
+  } catch {
+    return { runFiles: 0, orphanRunFiles: 0, orphanRecentFailures: [] };
+  }
+}
+
+function jobSummary(job) {
+  return {
+    id: job.id,
+    name: job.name,
+    owner: ownerKey(job),
+    status: job.status,
+    runs: job.analytics.runs,
+    failed: job.analytics.failed,
+    successRate: job.analytics.successRate,
+    lastRunAt: job.analytics.lastRunAt,
+    lastFailureAt: job.analytics.lastFailureAt,
+    lastFailureSummary: job.analytics.lastFailureSummary,
+  };
+}
+
+function isStaleJob(job, lastRun) {
+  if (!lastRun) return false;
+  const lastRunMs = runTimeMs(lastRun);
+  if (!lastRunMs) return false;
+  return Date.now() - lastRunMs > expectedCadenceMs(job) * 2.5;
+}
+
+function expectedCadenceMs(job) {
+  if (Number.isFinite(Number(job.schedule.everyMs)) && Number(job.schedule.everyMs) > 0) return Number(job.schedule.everyMs);
+  const fields = String(job.schedule.expr || "").trim().split(/\s+/);
+  if (fields.length !== 5) return 7 * 24 * 60 * 60 * 1000;
+  if (fields[2] !== "*" || fields[3] !== "*") return 32 * 24 * 60 * 60 * 1000;
+  if (fields[4] !== "*") return 7 * 24 * 60 * 60 * 1000;
+  if (fields[1].includes(",") || fields[1].includes("/") || fields[0].includes("/")) return 4 * 60 * 60 * 1000;
+  return 24 * 60 * 60 * 1000;
+}
+
+function ownerKey(job) {
+  if (job.agentId) return `agent:${job.agentId}`;
+  if (job.sessionTarget && job.sessionTarget !== "isolated") return `session:${job.sessionTarget}`;
+  if (job.sessionKey && !String(job.sessionKey).startsWith("cron:")) return `session:${job.sessionKey}`;
+  return "isolated";
+}
+
+function ownerLabel(job) {
+  return ownerKey(job)
+    .replace(/^agent:/, "Agent: ")
+    .replace(/^session:/, "")
+    .replace(/[-_]+/g, " ")
+    .replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function normalizeUsage(usage) {
+  if (!usage || typeof usage !== "object") return null;
+  return {
+    inputTokens: Number(usage.input_tokens || usage.inputTokens || 0),
+    outputTokens: Number(usage.output_tokens || usage.outputTokens || 0),
+    totalTokens: Number(usage.total_tokens || usage.totalTokens || 0),
+  };
+}
+
+function normalizeDeliveryBucket(value, configuredMode = "") {
+  const status = String(value || "").toLowerCase();
+  if (status === "delivered") return "delivered";
+  if (status === "not-delivered" || status === "failed" || status === "error") return "not-delivered";
+  if (status === "not-requested" || configuredMode === "none" || !configuredMode) return "not-requested";
+  return "unknown";
+}
+
+function runTimeMs(run) {
+  const value = Date.parse(run?.startedAt || run?.endedAt || "");
+  return Number.isFinite(value) ? value : 0;
+}
+
+function numericValues(values) {
+  return values.map(Number).filter((value) => Number.isFinite(value) && value >= 0);
+}
+
+function percentile(sortedValues, ratio) {
+  if (!sortedValues.length) return null;
+  const index = Math.min(sortedValues.length - 1, Math.floor((sortedValues.length - 1) * ratio));
+  return sortedValues[index];
+}
+
+function countBy(values, keyFn) {
+  return values.reduce((counts, value) => {
+    const key = keyFn(value) || "unknown";
+    counts[key] = (counts[key] || 0) + 1;
+    return counts;
+  }, {});
+}
+
+function mergeCounts(items) {
+  return items.reduce((totals, counts) => {
+    Object.entries(counts || {}).forEach(([key, value]) => {
+      totals[key] = (totals[key] || 0) + Number(value || 0);
+    });
+    return totals;
+  }, {});
 }
 
 function projectScheduledEvents(job) {
@@ -498,6 +804,10 @@ function stringifyLog(value) {
   } catch {
     return String(value);
   }
+}
+
+function firstLine(value) {
+  return String(value || "").split(/\r?\n/).find(Boolean) || "";
 }
 
 function isoAt(hour, minute, dayOffset = 0) {

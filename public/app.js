@@ -14,6 +14,7 @@ init();
 
 async function init() {
   data = await fetch("/api/overview").then((response) => response.json());
+  recordLocalUsage("visits");
   selectedJobId = data.jobs.find((job) => job.status === "failed")?.id || data.jobs[0]?.id || null;
   selectedRunId = selectedJob()?.lastRun?.id || null;
   setDefaultLogStream();
@@ -42,15 +43,15 @@ function render() {
         <main class="main">
           <div class="calendar-header">
             <div>
-              <div class="calendar-title">Cron calendar</div>
+              <div class="calendar-title">${viewMode === "insights" ? "Cron insights" : "Cron calendar"}</div>
               <div class="copy">${data.source === "openclaw" ? "Live OpenClaw data" : "Sample data until OpenClaw cron files are present"}</div>
             </div>
             <div class="segmented" aria-label="Calendar view">
-              ${["week", "today", "runs"].map((mode) => `<button class="segment ${viewMode === mode ? "active" : ""}" data-view="${mode}">${titleCase(mode)}</button>`).join("")}
+              ${["week", "today", "runs", "insights"].map((mode) => `<button class="segment ${viewMode === mode ? "active" : ""}" data-view="${mode}">${titleCase(mode)}</button>`).join("")}
             </div>
           </div>
           <div class="calendar-wrap">
-            ${viewMode === "runs" ? renderRunsView(visibleJobs) : renderCalendar(visibleEvents)}
+            ${viewMode === "runs" ? renderRunsView(visibleJobs) : viewMode === "insights" ? renderInsightsView(visibleJobs, visibleEvents) : renderCalendar(visibleEvents)}
             ${job ? renderPopover(job) : '<div class="empty">No cron jobs found.</div>'}
           </div>
         </main>
@@ -136,11 +137,13 @@ function healthRow(label, status, count) {
 
 function renderJobRow(job) {
   const owner = jobOwner(job);
+  const flags = jobFlags(job);
   return `
     <button class="job-row ${job.id === selectedJobId ? "selected" : ""}" data-job-id="${escapeAttr(job.id)}">
       <span>
         <span class="job-name"><span class="dot ${job.status}"></span>${escapeHtml(job.name)}</span>
         <span class="job-subtitle">${escapeHtml(formatSchedule(job.schedule))} · ${escapeHtml(owner.label)}</span>
+        ${flags.length ? `<span class="job-flags">${flags.map((flag) => `<span class="mini-flag ${flag.tone}">${escapeHtml(flag.label)}</span>`).join("")}</span>` : ""}
       </span>
       <span class="pill ${job.status}">${escapeHtml(job.status)}</span>
     </button>
@@ -210,6 +213,188 @@ function renderRunsView(jobs) {
   `;
 }
 
+function renderInsightsView(jobs, events) {
+  const insights = scopedInsights(jobs, events);
+  return `
+    <section class="insights-view">
+      <div class="insight-kpis">
+        ${kpiCard("14d success", formatPercent(insights.successRate), `${insights.failed} failed / ${insights.runs} runs`, insights.failed ? "failed" : "succeeded")}
+        ${kpiCard("Delivery gaps", formatNumber(insights.notDelivered), `${formatNumber(insights.delivered)} delivered`, insights.notDelivered ? "warning" : "succeeded")}
+        ${kpiCard("P90 runtime", formatDuration(insights.durationMs.p90), `max ${formatDuration(insights.durationMs.max)}`, insights.durationMs.p90 && insights.durationMs.p90 > 10 * 60 * 1000 ? "warning" : "succeeded")}
+        ${kpiCard("Token use", formatTokens(insights.totalTokens), `${formatTokens(insights.avgTokens)} avg/run`, "unknown")}
+        ${kpiCard("Schedule load", formatNumber(insights.schedule.upcoming), `${insights.schedule.closeStarts.length} close starts`, insights.schedule.closeStarts.length ? "warning" : "succeeded")}
+      </div>
+      <div class="insight-grid">
+        ${insightPanel("Owner Cockpits", renderOwnerInsights(insights.owners))}
+        ${insightPanel("Reliability Watch", renderReliabilityRows(insights))}
+        ${insightPanel("Delivery Audit", renderDeliveryRows(insights.deliveryProblems))}
+        ${insightPanel("Schedule Heatmap", renderScheduleHeatmap(insights.schedule))}
+        ${insightPanel("Runtime Outliers", renderRuntimeRows(insights.durationOutliers))}
+        ${insightPanel("Token Outliers", renderUsageRows(insights.usageOutliers))}
+        ${insightPanel("Archived History", renderArchivedRows(data.analytics?.archived))}
+        ${insightPanel("Local UI Activity", renderLocalUsage())}
+      </div>
+    </section>
+  `;
+}
+
+function kpiCard(label, value, detail, tone) {
+  return `
+    <div class="kpi-card ${tone}">
+      <span class="kpi-label">${escapeHtml(label)}</span>
+      <span class="kpi-value">${escapeHtml(value)}</span>
+      <span class="kpi-detail">${escapeHtml(detail)}</span>
+    </div>
+  `;
+}
+
+function insightPanel(title, body) {
+  return `
+    <section class="insight-panel">
+      <div class="panel-title">${escapeHtml(title)}</div>
+      ${body}
+    </section>
+  `;
+}
+
+function renderOwnerInsights(owners) {
+  if (!owners.length) return '<div class="empty compact">No owners in this scope.</div>';
+  return `
+    <div class="insight-list">
+      ${owners.map((owner) => `
+        <button class="insight-row" data-owner-filter="${escapeAttr(owner.key)}">
+          <span>
+            <span class="insight-main">${escapeHtml(owner.label)}</span>
+            <span class="insight-sub">${owner.jobs} jobs · ${owner.runs} runs · ${owner.failed} failed</span>
+          </span>
+          <span class="pill ${owner.failed ? "failed" : owner.noRuns ? "unknown" : "succeeded"}">${escapeHtml(formatTokens(owner.tokens))}</span>
+        </button>
+      `).join("")}
+    </div>
+  `;
+}
+
+function renderReliabilityRows(insights) {
+  const rows = [
+    ...insights.failures.map((job) => ({ job, tone: "failed", detail: `${job.analytics.failed} failures · last ${formatDateTime(job.analytics.lastFailureAt)}` })),
+    ...insights.recovered.map((job) => ({ job, tone: "warning", detail: `Recovered after ${job.analytics.failed} recent failure${job.analytics.failed === 1 ? "" : "s"}` })),
+    ...insights.noRuns.map((job) => ({ job, tone: "unknown", detail: "No recorded run history" })),
+    ...insights.stale.map((job) => ({ job, tone: "warning", detail: `Last run ${formatDateTime(job.analytics.lastRunAt)}` })),
+  ];
+  if (!rows.length) return '<div class="empty compact">No reliability warnings in this scope.</div>';
+  return `
+    <div class="insight-list">
+      ${rows.slice(0, 12).map(({ job, tone, detail }) => renderInsightJobRow(job, detail, tone)).join("")}
+    </div>
+  `;
+}
+
+function renderDeliveryRows(rows) {
+  if (!rows.length) return '<div class="empty compact">No delivery gaps in this scope.</div>';
+  return `
+    <div class="insight-list">
+      ${rows.slice(0, 12).map(({ job, notDelivered, unknown, delivered }) => renderInsightJobRow(job, `${notDelivered} not delivered · ${unknown} unknown · ${delivered} delivered`, notDelivered ? "failed" : "warning")).join("")}
+    </div>
+  `;
+}
+
+function renderScheduleHeatmap(schedule) {
+  const max = Math.max(1, ...schedule.byHour.map((item) => item.count));
+  return `
+    <div class="hour-bars">
+      ${schedule.byHour.map((item) => `
+        <div class="hour-bar" title="${formatHour(item.hour)} ${item.count} projected starts">
+          <span style="height:${Math.max(4, Math.round((item.count / max) * 54))}px"></span>
+          <small>${item.hour}</small>
+        </div>
+      `).join("")}
+    </div>
+    <div class="insight-list tight">
+      ${schedule.closeStarts.slice(0, 6).map((item) => `
+        <div class="insight-row static">
+          <span>
+            <span class="insight-main">${escapeHtml(formatDateTime(item.when))}</span>
+            <span class="insight-sub">${escapeHtml(item.jobs.join(" / "))}</span>
+          </span>
+          <span class="pill warning">${item.gapMinutes}m</span>
+        </div>
+      `).join("") || '<div class="empty compact">No close starts in this scope.</div>'}
+    </div>
+  `;
+}
+
+function renderRuntimeRows(rows) {
+  if (!rows.length) return '<div class="empty compact">No runtime data in this scope.</div>';
+  return `
+    <div class="insight-list">
+      ${rows.slice(0, 10).map(({ job, p90Ms, maxMs, timeoutRisk }) => renderInsightJobRow(job, `p90 ${formatDuration(p90Ms)} · max ${formatDuration(maxMs)}`, timeoutRisk ? "failed" : "warning")).join("")}
+    </div>
+  `;
+}
+
+function renderUsageRows(rows) {
+  if (!rows.length) return '<div class="empty compact">No token usage data in this scope.</div>';
+  return `
+    <div class="insight-list">
+      ${rows.slice(0, 10).map(({ job, totalTokens, avgTokens }) => renderInsightJobRow(job, `${formatTokens(totalTokens)} total · ${formatTokens(avgTokens)} avg`, "unknown")).join("")}
+    </div>
+  `;
+}
+
+function renderArchivedRows(archived) {
+  if (!archived) return '<div class="empty compact">No archived run data available.</div>';
+  return `
+    <div class="archive-summary">
+      <span>${formatNumber(archived.runFiles)} run files</span>
+      <span>${formatNumber(archived.orphanRunFiles)} orphan histories</span>
+    </div>
+    <div class="insight-list tight">
+      ${(archived.orphanRecentFailures || []).slice(0, 5).map((item) => `
+        <div class="insight-row static">
+          <span>
+            <span class="insight-main">${escapeHtml(item.id)}</span>
+            <span class="insight-sub">${escapeHtml(item.summary || "Recent failure in archived job")}</span>
+          </span>
+          <span class="pill failed">${escapeHtml(formatDateTime(item.lastFailureAt))}</span>
+        </div>
+      `).join("") || '<div class="empty compact">No recent orphan failures.</div>'}
+    </div>
+  `;
+}
+
+function renderLocalUsage() {
+  const usage = localUsage();
+  return `
+    <div class="usage-grid">
+      ${[
+        ["Visits", usage.visits],
+        ["Job opens", usage.jobOpens],
+        ["Filter changes", usage.filterChanges],
+        ["View changes", usage.viewChanges],
+        ["Search edits", usage.searchEdits],
+        ["Refreshes", usage.refreshes],
+      ].map(([label, value]) => `
+        <div class="usage-cell">
+          <span>${escapeHtml(label)}</span>
+          <strong>${formatNumber(value || 0)}</strong>
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+
+function renderInsightJobRow(job, detail, tone) {
+  return `
+    <button class="insight-row" data-job-id="${escapeAttr(job.id)}">
+      <span>
+        <span class="insight-main"><span class="dot ${job.status}"></span>${escapeHtml(job.name)}</span>
+        <span class="insight-sub">${escapeHtml(detail)}</span>
+      </span>
+      <span class="pill ${tone}">${escapeHtml(jobOwner(job).label)}</span>
+    </button>
+  `;
+}
+
 function renderEvent(event) {
   const date = new Date(event.startedAt);
   const top = Math.max(0, date.getHours() * 60 + date.getMinutes());
@@ -228,7 +413,7 @@ function renderEvent(event) {
 function renderPopover(job) {
   const run = selectedRun(job);
   const runStatus = run?.status || job.status;
-  const tabs = ["summary", "steps", "openclaw", "logs", "history", "raw"];
+  const tabs = ["summary", "metrics", "steps", "openclaw", "logs", "history", "raw"];
   return `
     <aside class="popover">
       <div class="popover-head">
@@ -275,11 +460,34 @@ function renderTab(job, run) {
           ["Likely cause", diagnosis.cause],
           ["Last successful run", formatDateTime(job.recentRuns.find((item) => item.status === "succeeded")?.startedAt)],
           ["Owner / session", jobOwner(job).label],
+          ["14d reliability", formatReliability(job)],
+          ["Recent delivery", formatDeliveryCounts(job.analytics?.delivery)],
           ["Delivery", formatDeliveryStatus(run, job)],
           ["Reports", formatDelivery(job)],
           ["Timeout", formatTimeout(job.payload.timeoutSeconds)],
           ["Failure route", job.delivery.failureDestination || fallbackFailureRoute(job)],
           ["Host", data.host],
+        ])}
+      </div>
+    `;
+  }
+
+  if (selectedTab === "metrics") {
+    return `
+      <div class="tab-panel">
+        <div class="metric-strip">
+          ${kpiCard("14d success", formatPercent(job.analytics?.successRate), `${job.analytics?.failed || 0} failed / ${job.analytics?.runs || 0} runs`, job.analytics?.failed ? "failed" : "succeeded")}
+          ${kpiCard("P90 runtime", formatDuration(job.analytics?.durationMs?.p90), `max ${formatDuration(job.analytics?.durationMs?.max)}`, job.analytics?.timeoutRisk ? "failed" : "unknown")}
+          ${kpiCard("Token use", formatTokens(job.analytics?.usage?.totalTokens), `${formatTokens(job.analytics?.usage?.avgTokens)} avg`, "unknown")}
+        </div>
+        ${renderMetaGrid([
+          ["Recovered failure", job.analytics?.recovered ? "yes" : "no"],
+          ["No run history", job.analytics?.noRuns ? "yes" : "no"],
+          ["Stale cadence", job.analytics?.stale ? "yes" : "no"],
+          ["Last failure", formatDateTime(job.analytics?.lastFailureAt)],
+          ["Last failure summary", job.analytics?.lastFailureSummary || "None recorded"],
+          ["Delivery counts", formatDeliveryCounts(job.analytics?.delivery)],
+          ["Timeout risk", job.analytics?.timeoutRisk ? "p90 is near timeout" : "not flagged"],
         ])}
       </div>
     `;
@@ -407,6 +615,7 @@ function renderMetaGrid(rows) {
 
 function bindEvents() {
   document.querySelector('[data-action="home"]')?.addEventListener("click", () => {
+    recordLocalUsage("homeClicks");
     searchTerm = "";
     statusFilter = "all";
     ownerFilter = "all";
@@ -417,7 +626,10 @@ function bindEvents() {
     setDefaultLogStream();
     render();
   });
-  document.querySelector('[data-action="refresh"]')?.addEventListener("click", refresh);
+  document.querySelector('[data-action="refresh"]')?.addEventListener("click", () => {
+    recordLocalUsage("refreshes");
+    refresh();
+  });
   document.querySelector('[data-action="raw"]')?.addEventListener("click", () => {
     selectedTab = "raw";
     render();
@@ -429,6 +641,7 @@ function bindEvents() {
   });
   document.querySelectorAll("[data-view]").forEach((element) => {
     element.addEventListener("click", () => {
+      recordLocalUsage("viewChanges");
       viewMode = element.dataset.view || "week";
       render();
     });
@@ -440,12 +653,14 @@ function bindEvents() {
     });
   });
   document.querySelector("[data-search]")?.addEventListener("input", (event) => {
+    recordLocalUsage("searchEdits");
     searchTerm = event.target.value;
     keepSelectionVisible();
     render();
   });
   document.querySelectorAll("[data-status-filter]").forEach((element) => {
     element.addEventListener("click", () => {
+      recordLocalUsage("filterChanges");
       statusFilter = element.dataset.statusFilter || "all";
       keepSelectionVisible();
       render();
@@ -453,6 +668,7 @@ function bindEvents() {
   });
   document.querySelectorAll("[data-owner-filter]").forEach((element) => {
     element.addEventListener("click", () => {
+      recordLocalUsage("filterChanges");
       ownerFilter = element.dataset.ownerFilter || "all";
       statusFilter = "all";
       keepSelectionVisible();
@@ -461,6 +677,7 @@ function bindEvents() {
   });
   document.querySelectorAll("[data-job-id]").forEach((element) => {
     element.addEventListener("click", () => {
+      recordLocalUsage("jobOpens");
       selectedJobId = element.dataset.jobId;
       selectedRunId = element.dataset.runId || selectedJob()?.lastRun?.id || null;
       selectedTab = "summary";
@@ -470,6 +687,7 @@ function bindEvents() {
   });
   document.querySelectorAll("[data-tab]").forEach((element) => {
     element.addEventListener("click", () => {
+      recordLocalUsage("tabChanges");
       selectedTab = element.dataset.tab;
       render();
     });
@@ -633,6 +851,120 @@ function isConstraintLine(value) {
   return /^(do not|don't|stay silent|no reply|no notification|critical|rules?:|if stdout|if stderr|final answer)/i.test(String(value || "").trim());
 }
 
+function scopedInsights(jobs, events) {
+  const runs = jobs.reduce((sum, job) => sum + (job.analytics?.runs || 0), 0);
+  const succeeded = jobs.reduce((sum, job) => sum + (job.analytics?.succeeded || 0), 0);
+  const failed = jobs.reduce((sum, job) => sum + (job.analytics?.failed || 0), 0);
+  const delivered = jobs.reduce((sum, job) => sum + (job.analytics?.delivery?.delivered || 0), 0);
+  const notDelivered = jobs.reduce((sum, job) => sum + (job.analytics?.delivery?.["not-delivered"] || 0), 0);
+  const durations = jobs.flatMap((job) => [job.analytics?.durationMs?.p50, job.analytics?.durationMs?.p90, job.analytics?.durationMs?.p99, job.analytics?.durationMs?.max]).map(Number).filter((value) => Number.isFinite(value) && value >= 0).sort((a, b) => a - b);
+  const totalTokens = jobs.reduce((sum, job) => sum + (job.analytics?.usage?.totalTokens || 0), 0);
+  const failures = jobs.filter((job) => job.analytics?.failed > 0).sort((a, b) => b.analytics.failed - a.analytics.failed);
+  const recovered = jobs.filter((job) => job.analytics?.recovered);
+  const noRuns = jobs.filter((job) => job.analytics?.noRuns);
+  const stale = jobs.filter((job) => job.analytics?.stale);
+  const deliveryProblems = jobs
+    .map((job) => ({
+      job,
+      notDelivered: job.analytics?.delivery?.["not-delivered"] || 0,
+      unknown: job.analytics?.delivery?.unknown || 0,
+      delivered: job.analytics?.delivery?.delivered || 0,
+    }))
+    .filter((item) => item.notDelivered || item.unknown)
+    .sort((a, b) => b.notDelivered - a.notDelivered || b.unknown - a.unknown);
+  const durationOutliers = jobs
+    .filter((job) => job.analytics?.durationMs?.p90)
+    .map((job) => ({ job, p90Ms: job.analytics.durationMs.p90, maxMs: job.analytics.durationMs.max, timeoutRisk: job.analytics.timeoutRisk }))
+    .sort((a, b) => b.p90Ms - a.p90Ms);
+  const usageOutliers = jobs
+    .filter((job) => job.analytics?.usage?.totalTokens)
+    .map((job) => ({ job, totalTokens: job.analytics.usage.totalTokens, avgTokens: job.analytics.usage.avgTokens }))
+    .sort((a, b) => b.totalTokens - a.totalTokens);
+
+  return {
+    runs,
+    succeeded,
+    failed,
+    successRate: runs ? succeeded / runs : null,
+    delivered,
+    notDelivered,
+    durationMs: {
+      p90: percentile(durations, 0.9),
+      max: durations.length ? durations[durations.length - 1] : null,
+    },
+    totalTokens,
+    avgTokens: runs ? Math.round(totalTokens / runs) : null,
+    owners: scopedOwnerInsights(jobs),
+    failures,
+    recovered,
+    noRuns,
+    stale,
+    deliveryProblems,
+    durationOutliers,
+    usageOutliers,
+    schedule: scopedScheduleInsights(events),
+  };
+}
+
+function scopedOwnerInsights(jobs) {
+  const owners = new Map();
+  jobs.forEach((job) => {
+    const owner = jobOwner(job);
+    if (!owners.has(owner.key)) {
+      owners.set(owner.key, { key: owner.key, label: owner.label, jobs: 0, runs: 0, failed: 0, recovered: 0, noRuns: 0, tokens: 0 });
+    }
+    const row = owners.get(owner.key);
+    row.jobs += 1;
+    row.runs += job.analytics?.runs || 0;
+    row.failed += job.analytics?.failed || 0;
+    row.recovered += job.analytics?.recovered ? 1 : 0;
+    row.noRuns += job.analytics?.noRuns ? 1 : 0;
+    row.tokens += job.analytics?.usage?.totalTokens || 0;
+  });
+  return [...owners.values()].sort((a, b) => b.jobs - a.jobs || a.label.localeCompare(b.label));
+}
+
+function scopedScheduleInsights(events) {
+  const upcoming = events.filter((event) => event.kind !== "run" && event.startedAt);
+  const byHour = Array.from({ length: 24 }, (_, hour) => ({ hour, count: 0 }));
+  upcoming.forEach((event) => {
+    byHour[new Date(event.startedAt).getHours()].count += 1;
+  });
+  const closeStarts = [];
+  const sorted = [...upcoming].sort((a, b) => Date.parse(a.startedAt) - Date.parse(b.startedAt));
+  for (let index = 1; index < sorted.length; index += 1) {
+    const previous = sorted[index - 1];
+    const current = sorted[index];
+    const gapMinutes = (Date.parse(current.startedAt) - Date.parse(previous.startedAt)) / 60000;
+    if (gapMinutes >= 0 && gapMinutes <= 5) {
+      closeStarts.push({
+        when: current.startedAt,
+        gapMinutes: Math.round(gapMinutes),
+        jobs: [previous.jobName, current.jobName],
+      });
+    }
+  }
+  return { upcoming: upcoming.length, byHour, closeStarts };
+}
+
+function jobFlags(job) {
+  const flags = [];
+  if (job.analytics?.failed) flags.push({ label: `${job.analytics.failed} recent fail`, tone: "failed" });
+  if (job.analytics?.recovered) flags.push({ label: "recovered", tone: "warning" });
+  if (job.analytics?.noRuns) flags.push({ label: "no runs", tone: "unknown" });
+  if (job.analytics?.stale) flags.push({ label: "stale", tone: "warning" });
+  if (job.analytics?.timeoutRisk) flags.push({ label: "timeout risk", tone: "failed" });
+  return flags.slice(0, 3);
+}
+
+function deliveryBucket(run, job) {
+  const status = String(run?.deliveryStatus || "").toLowerCase();
+  if (status === "delivered") return "delivered";
+  if (status === "not-delivered" || status === "failed" || status === "error") return "not-delivered";
+  if (status === "not-requested" || job?.delivery?.mode === "none") return "not-requested";
+  return status ? "unknown" : "not-requested";
+}
+
 function filteredJobs() {
   return scopedJobs().filter((job) => statusFilter === "all" || job.status === statusFilter);
 }
@@ -656,6 +988,10 @@ function scopedJobs() {
       job.delivery?.mode,
       job.delivery?.channel,
       job.delivery?.to,
+      job.analytics?.lastFailureSummary,
+      job.analytics?.failed ? "recent failure recovered reliability" : "",
+      job.analytics?.noRuns ? "no runs never run" : "",
+      job.analytics?.stale ? "stale cadence" : "",
     ]
       .filter(Boolean)
       .join(" ")
@@ -824,6 +1160,46 @@ function isSameDay(value, date) {
   return item.getFullYear() === date.getFullYear() && item.getMonth() === date.getMonth() && item.getDate() === date.getDate();
 }
 
+function formatReliability(job) {
+  if (!job.analytics) return "Unknown";
+  if (!job.analytics.runs) return "No runs in window";
+  return `${formatPercent(job.analytics.successRate)} · ${job.analytics.failed || 0} failed / ${job.analytics.runs} runs`;
+}
+
+function formatDeliveryCounts(delivery = {}) {
+  const parts = [
+    ["delivered", delivery.delivered],
+    ["not delivered", delivery["not-delivered"]],
+    ["not requested", delivery["not-requested"]],
+    ["unknown", delivery.unknown],
+  ].filter(([, value]) => value);
+  return parts.length ? parts.map(([label, value]) => `${value} ${label}`).join(" · ") : "No delivery records";
+}
+
+function formatPercent(value) {
+  if (value === null || value === undefined || !Number.isFinite(Number(value))) return "n/a";
+  return `${Math.round(Number(value) * 100)}%`;
+}
+
+function formatNumber(value) {
+  const number = Number(value || 0);
+  return number.toLocaleString();
+}
+
+function formatTokens(value) {
+  const number = Number(value || 0);
+  if (!number) return "0";
+  if (number >= 1000000) return `${(number / 1000000).toFixed(number >= 10000000 ? 0 : 1)}M`;
+  if (number >= 1000) return `${(number / 1000).toFixed(number >= 10000 ? 0 : 1)}k`;
+  return String(Math.round(number));
+}
+
+function percentile(sortedValues, ratio) {
+  if (!sortedValues.length) return null;
+  const index = Math.min(sortedValues.length - 1, Math.floor((sortedValues.length - 1) * ratio));
+  return sortedValues[index];
+}
+
 function formatSchedule(schedule) {
   if (!schedule) return "No schedule";
   if (schedule.kind === "at") return schedule.at || "one-shot";
@@ -900,6 +1276,25 @@ function tabLabel(value) {
 
 function firstLine(value) {
   return String(value || "").split(/\r?\n/).find(Boolean) || "";
+}
+
+function localUsage() {
+  try {
+    return JSON.parse(window.localStorage.getItem("openclaw-cron-monitor-usage") || "{}") || {};
+  } catch {
+    return {};
+  }
+}
+
+function recordLocalUsage(key) {
+  try {
+    const usage = localUsage();
+    usage[key] = Number(usage[key] || 0) + 1;
+    usage.lastSeenAt = new Date().toISOString();
+    window.localStorage.setItem("openclaw-cron-monitor-usage", JSON.stringify(usage));
+  } catch {
+    // Local usage telemetry is best-effort and browser-local only.
+  }
 }
 
 function escapeHtml(value) {

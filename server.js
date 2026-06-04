@@ -105,7 +105,7 @@ export async function loadOverview() {
   return {
     generatedAt: new Date().toISOString(),
     source: source.kind,
-    paths: { jobsPath, statePath, runsDir },
+    paths: { jobsPath: source.paths?.jobsPath || jobsPath, statePath: source.paths?.statePath || statePath, runsDir },
     host: hostLabel,
     networkLabel,
     jobs: jobsWithRuns,
@@ -117,11 +117,13 @@ export async function loadOverview() {
 
 async function loadOpenClawData() {
   try {
-    const jobsRaw = await readJson(jobsPath);
-    const stateRaw = await readJson(statePath).catch(() => ({}));
+    const jobsRead = await readJsonResolved(jobsPath);
+    const stateRead = await readJsonResolved(statePath).catch(() => ({ data: {}, path: statePath }));
+    const jobsRaw = jobsRead.data;
+    const stateRaw = stateRead.data;
     const jobs = extractJobs(jobsRaw);
     if (jobs.length > 0) {
-      return { kind: "openclaw", jobs, state: normalizeStateMap(stateRaw) };
+      return { kind: "openclaw", jobs, state: normalizeStateMap(stateRaw), paths: { jobsPath: jobsRead.path, statePath: stateRead.path } };
     }
   } catch {
     // Fall through to sample data so the UI remains useful before OpenClaw is installed.
@@ -216,7 +218,7 @@ function deriveJobStatus(job, state, lastRun) {
 }
 
 export async function loadRuns(jobId, limit = 50) {
-  const filePath = path.join(runsDir, `${jobId}.jsonl`);
+  const filePath = await resolveExistingPath(path.join(runsDir, `${jobId}.jsonl`));
   try {
     const text = await readFile(filePath, "utf8");
     return parseRunLines(text, jobId).slice(0, limit);
@@ -497,8 +499,8 @@ function scheduleAnalytics(events) {
 
 async function archivedRunAnalytics(currentJobIds, windowStartMs) {
   try {
-    const files = (await readdir(runsDir)).filter((file) => file.endsWith(".jsonl"));
-    const orphanIds = files.map((file) => file.replace(/\.jsonl$/, "")).filter((jobId) => !currentJobIds.has(jobId));
+    const files = (await readdir(runsDir)).filter((file) => /\.jsonl(?:\.migrated)?$/.test(file));
+    const orphanIds = files.map((file) => file.replace(/\.jsonl(?:\.migrated)?$/, "")).filter((jobId) => !currentJobIds.has(jobId));
     const orphanFailures = [];
     for (const jobId of orphanIds.slice(0, 100)) {
       const runs = await loadRuns(jobId, 100);
@@ -763,6 +765,24 @@ async function serveStatic(requestPath, res) {
 
 async function readJson(filePath) {
   return JSON.parse(await readFile(filePath, "utf8"));
+}
+
+async function readJsonResolved(filePath) {
+  const resolvedPath = await resolveExistingPath(filePath);
+  return { data: await readJson(resolvedPath), path: resolvedPath };
+}
+
+async function resolveExistingPath(filePath) {
+  const candidates = [filePath, `${filePath}.migrated`];
+  for (const candidate of candidates) {
+    try {
+      const info = await stat(candidate);
+      if (info.isFile()) return candidate;
+    } catch {
+      // Try the next compatible filename.
+    }
+  }
+  return filePath;
 }
 
 function sendJson(res, value, status = 200) {

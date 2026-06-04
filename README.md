@@ -40,13 +40,13 @@ http://localhost:3817
 From npm:
 
 ```bash
-pi install npm:openclaw-cron-monitor@0.1.1
+pi install npm:openclaw-cron-monitor@0.1.2
 ```
 
 From a git repository:
 
 ```bash
-pi install git:github.com/<your-github-username>/openclaw-cron-monitor@v0.1.1
+pi install git:github.com/<your-github-username>/openclaw-cron-monitor@v0.1.2
 ```
 
 From a local checkout:
@@ -85,6 +85,8 @@ Defaults:
 - `PORT=3817`
 - `OPENCLAW_MONITOR_NETWORK_LABEL=Private network`
 - `OPENCLAW_MONITOR_HOST_LABEL=<system hostname>`
+
+The monitor automatically falls back to OpenClaw's migrated store names when present, including `jobs.json.migrated`, `jobs-state.json.migrated`, and `runs/*.jsonl.migrated`.
 
 Example:
 

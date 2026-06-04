@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "name": "openclaw-cron-monitor",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "displayName": "OpenClaw Cron Monitor",
   "description": "Read-only dashboard and tools for OpenClaw cron jobs and recurring task runs.",
   "entry": "./extensions/openclaw-cron-monitor.ts",
@@ -13,8 +13,11 @@
     "filesystem": {
       "read": [
         "~/.openclaw/cron/jobs.json",
+        "~/.openclaw/cron/jobs.json.migrated",
         "~/.openclaw/cron/jobs-state.json",
-        "~/.openclaw/cron/runs/*.jsonl"
+        "~/.openclaw/cron/jobs-state.json.migrated",
+        "~/.openclaw/cron/runs/*.jsonl",
+        "~/.openclaw/cron/runs/*.jsonl.migrated"
       ],
       "write": []
     },

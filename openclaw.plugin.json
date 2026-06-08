@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "name": "openclaw-cron-monitor",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "displayName": "OpenClaw Cron Monitor",
   "description": "Read-only dashboard and tools for OpenClaw cron jobs and recurring task runs.",
   "entry": "./extensions/openclaw-cron-monitor.ts",

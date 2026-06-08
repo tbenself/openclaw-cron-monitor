@@ -213,9 +213,10 @@ function inferScheduleKind(job, schedule) {
 }
 
 function deriveJobStatus(job, state, lastRun) {
-  if (!job.enabled) return "unknown";
   if (state?.running || state?.activeRunId || state?.status === "running") return "running";
   const status = String(lastRun?.status || state?.lastRunStatus || state?.lastStatus || "").toLowerCase();
+  if (!job.enabled && ["warning", "failed"].includes(status)) return status;
+  if (!job.enabled) return "unknown";
   if (["succeeded", "success", "ok", "completed"].includes(status)) return "succeeded";
   if (["failed", "error", "timed_out", "cancelled", "lost"].includes(status)) return "failed";
   if (["warning", "retrying", "queued"].includes(status)) return "warning";
@@ -280,18 +281,24 @@ function normalizeTaskRun(row, index) {
   const startedAt = msToIso(row.started_at) || msToIso(row.created_at) || msToIso(row.last_event_at);
   const endedAt = msToIso(row.ended_at) || msToIso(row.last_event_at);
   const summary = row.terminal_summary || row.progress_summary || row.terminal_outcome || row.label || "";
+  const stderr = stringifyLog(row.error || "");
+  const status = classifyRunOutcome(normalizeRunStatus(row.status || row.terminal_outcome), {
+    summary,
+    stderr,
+    deliveryStatus: row.delivery_status || "",
+  });
   return {
     id: String(row.run_id || row.task_id || `${row.source_id}-task-${row.started_at || row.created_at || index}`),
     taskId: row.task_id || "",
     jobId: String(row.source_id),
-    status: normalizeRunStatus(row.status || row.terminal_outcome),
+    status,
     exitCode: null,
     startedAt,
     endedAt,
     durationMs: calculateDurationMs(startedAt, endedAt),
     summary,
     stdout: "",
-    stderr: stringifyLog(row.error || ""),
+    stderr,
     delivery: {},
     deliveryStatus: row.delivery_status || "",
     delivered: null,
@@ -351,18 +358,25 @@ function normalizeRun(run, jobId, index) {
   const durationMs = run.durationMs || calculateDurationMs(startedAt, endedAt);
   const stableTime = run.runAtMs || run.ts || Date.parse(startedAt || "") || index;
   const deliveryStatus = run.deliveryStatus || (run.delivered === true ? "delivered" : run.delivered === false ? "not-delivered" : "");
+  const summary = run.summary || run.final || run.result?.summary || run.message || "";
+  const stderr = stringifyLog(run.stderr || run.logs?.stderr || run.error || run.result?.stderr || "");
+  const status = classifyRunOutcome(normalizeRunStatus(run.status || run.outcome || run.result?.status), {
+    summary,
+    stderr,
+    deliveryStatus,
+  });
   return {
     id: String(run.runId || run.id || `${jobId}-${stableTime}`),
     taskId: run.taskId || run.task?.id || "",
     jobId,
-    status: normalizeRunStatus(run.status || run.outcome || run.result?.status),
+    status,
     exitCode: run.exitCode ?? run.result?.exitCode ?? null,
     startedAt,
     endedAt,
     durationMs,
-    summary: run.summary || run.final || run.result?.summary || run.message || "",
+    summary,
     stdout: run.stdout || run.logs?.stdout || run.result?.stdout || "",
-    stderr: stringifyLog(run.stderr || run.logs?.stderr || run.error || run.result?.stderr || ""),
+    stderr,
     delivery: run.delivery || {},
     deliveryStatus,
     delivered: run.delivered ?? run.delivery?.delivered ?? null,
@@ -380,6 +394,46 @@ function normalizeRunStatus(status) {
   if (["success", "ok", "completed", "complete"].includes(normalized)) return "succeeded";
   if (["error"].includes(normalized)) return "failed";
   return normalized;
+}
+
+function classifyRunOutcome(status, run = {}) {
+  const normalized = normalizeRunStatus(status);
+  if (normalized !== "succeeded") return normalized;
+  return hasSemanticBlocker(run) ? "warning" : normalized;
+}
+
+function hasSemanticBlocker(run = {}) {
+  const text = [
+    run.summary,
+    run.stderr,
+    run.error,
+    run.deliveryStatus,
+    run.raw?.terminal_outcome,
+  ]
+    .filter(Boolean)
+    .join("\n")
+    .toLowerCase();
+
+  if (!text) return false;
+  return [
+    "needs re-authentication",
+    "needs reauthentication",
+    "reauthentication required",
+    "re-authentication required",
+    "not authenticated",
+    "unauthorized",
+    "permission denied",
+    "access denied",
+    "forbidden",
+    "failed:",
+    "error:",
+    "exception",
+    "traceback",
+    "timed out",
+    "timeout",
+    "could not",
+    "unable to",
+  ].some((pattern) => text.includes(pattern));
 }
 
 function calculateDurationMs(startedAt, endedAt) {
@@ -430,11 +484,13 @@ function jobAnalytics(job, runs, windowStartMs) {
   const windowRuns = runs.filter((run) => runTimeMs(run) >= windowStartMs);
   const successfulRuns = windowRuns.filter((run) => run.status === "succeeded");
   const failedRuns = windowRuns.filter((run) => run.status === "failed");
+  const warningRuns = windowRuns.filter((run) => run.status === "warning");
   const delivery = countBy(windowRuns, (run) => normalizeDeliveryBucket(run.deliveryStatus, job.delivery.mode));
   const durations = numericValues(windowRuns.map((run) => run.durationMs)).sort((a, b) => a - b);
   const usageRuns = windowRuns.filter((run) => run.usage?.totalTokens);
   const totalTokens = usageRuns.reduce((sum, run) => sum + Number(run.usage.totalTokens || 0), 0);
   const lastFailure = failedRuns[0] || null;
+  const lastWarning = warningRuns[0] || null;
   const timeoutMs = Number(job.payload.timeoutSeconds) > 0 ? Number(job.payload.timeoutSeconds) * 1000 : null;
   const p90DurationMs = percentile(durations, 0.9);
 
@@ -443,6 +499,7 @@ function jobAnalytics(job, runs, windowStartMs) {
     runs: windowRuns.length,
     succeeded: successfulRuns.length,
     failed: failedRuns.length,
+    warning: warningRuns.length,
     successRate: windowRuns.length ? successfulRuns.length / windowRuns.length : null,
     recovered: failedRuns.length > 0 && windowRuns[0]?.status === "succeeded",
     noRuns: runs.length === 0,
@@ -450,6 +507,8 @@ function jobAnalytics(job, runs, windowStartMs) {
     lastRunAt: runs[0]?.startedAt || null,
     lastFailureAt: lastFailure?.startedAt || null,
     lastFailureSummary: firstLine(lastFailure?.summary || lastFailure?.stderr || ""),
+    lastWarningAt: lastWarning?.startedAt || null,
+    lastWarningSummary: firstLine(lastWarning?.summary || lastWarning?.stderr || ""),
     delivery,
     durationMs: {
       p50: percentile(durations, 0.5),
@@ -470,6 +529,9 @@ async function buildOverviewAnalytics(jobs, events, windowStartMs) {
   const failures = jobs
     .filter((job) => job.analytics.failed > 0)
     .sort((a, b) => b.analytics.failed - a.analytics.failed || Date.parse(b.analytics.lastFailureAt || 0) - Date.parse(a.analytics.lastFailureAt || 0));
+  const warnings = jobs
+    .filter((job) => job.analytics.warning > 0)
+    .sort((a, b) => b.analytics.warning - a.analytics.warning || Date.parse(b.analytics.lastWarningAt || 0) - Date.parse(a.analytics.lastWarningAt || 0));
   const recovered = jobs.filter((job) => job.analytics.recovered).sort((a, b) => Date.parse(b.analytics.lastFailureAt || 0) - Date.parse(a.analytics.lastFailureAt || 0));
   const noRuns = jobs.filter((job) => job.analytics.noRuns);
   const stale = jobs.filter((job) => job.analytics.stale);
@@ -512,6 +574,7 @@ async function buildOverviewAnalytics(jobs, events, windowStartMs) {
   const totalRuns = jobs.reduce((sum, job) => sum + job.analytics.runs, 0);
   const totalSucceeded = jobs.reduce((sum, job) => sum + job.analytics.succeeded, 0);
   const totalFailed = jobs.reduce((sum, job) => sum + job.analytics.failed, 0);
+  const totalWarnings = jobs.reduce((sum, job) => sum + job.analytics.warning, 0);
   const deliveryCounts = mergeCounts(jobs.map((job) => job.analytics.delivery));
   const durations = numericValues(jobs.flatMap((job) => [job.analytics.durationMs.p50, job.analytics.durationMs.p90, job.analytics.durationMs.p99, job.analytics.durationMs.max])).sort((a, b) => a - b);
   const totalTokens = jobs.reduce((sum, job) => sum + job.analytics.usage.totalTokens, 0);
@@ -522,6 +585,7 @@ async function buildOverviewAnalytics(jobs, events, windowStartMs) {
       runs: totalRuns,
       succeeded: totalSucceeded,
       failed: totalFailed,
+      warning: totalWarnings,
       successRate: totalRuns ? totalSucceeded / totalRuns : null,
       totalTokens,
       avgTokens: totalRuns ? Math.round(totalTokens / totalRuns) : null,
@@ -536,6 +600,7 @@ async function buildOverviewAnalytics(jobs, events, windowStartMs) {
     owners: ownerAnalytics(jobs),
     reliability: {
       failures: failures.slice(0, 12).map(jobSummary),
+      warnings: warnings.slice(0, 12).map(jobSummary),
       recovered: recovered.slice(0, 12).map(jobSummary),
       noRuns: noRuns.slice(0, 12).map(jobSummary),
       stale: stale.slice(0, 12).map(jobSummary),
@@ -553,12 +618,13 @@ function ownerAnalytics(jobs) {
   jobs.forEach((job) => {
     const key = ownerKey(job);
     if (!owners.has(key)) {
-      owners.set(key, { key, label: ownerLabel(job), jobs: 0, runs: 0, failed: 0, recovered: 0, noRuns: 0, tokens: 0 });
+      owners.set(key, { key, label: ownerLabel(job), jobs: 0, runs: 0, failed: 0, warning: 0, recovered: 0, noRuns: 0, tokens: 0 });
     }
     const owner = owners.get(key);
     owner.jobs += 1;
     owner.runs += job.analytics.runs;
     owner.failed += job.analytics.failed;
+    owner.warning += job.analytics.warning;
     owner.recovered += job.analytics.recovered ? 1 : 0;
     owner.noRuns += job.analytics.noRuns ? 1 : 0;
     owner.tokens += job.analytics.usage.totalTokens;
@@ -635,10 +701,13 @@ function jobSummary(job) {
     status: job.status,
     runs: job.analytics.runs,
     failed: job.analytics.failed,
+    warning: job.analytics.warning,
     successRate: job.analytics.successRate,
     lastRunAt: job.analytics.lastRunAt,
     lastFailureAt: job.analytics.lastFailureAt,
     lastFailureSummary: job.analytics.lastFailureSummary,
+    lastWarningAt: job.analytics.lastWarningAt,
+    lastWarningSummary: job.analytics.lastWarningSummary,
   };
 }
 

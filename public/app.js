@@ -87,6 +87,7 @@ function renderSidebar() {
         ${healthRow("All", "all", counts.total)}
         ${healthRow("Running", "running", counts.running)}
         ${healthRow("Succeeded", "succeeded", counts.succeeded)}
+        ${healthRow("Warning", "warning", counts.warning)}
         ${healthRow("Failed", "failed", counts.failed)}
         ${healthRow("Skipped", "skipped", counts.skipped)}
         ${healthRow("Unknown", "unknown", counts.unknown)}
@@ -265,9 +266,9 @@ function renderOwnerInsights(owners) {
         <button class="insight-row" data-owner-filter="${escapeAttr(owner.key)}">
           <span>
             <span class="insight-main">${escapeHtml(owner.label)}</span>
-            <span class="insight-sub">${owner.jobs} jobs · ${owner.runs} runs · ${owner.failed} failed</span>
+            <span class="insight-sub">${owner.jobs} jobs · ${owner.runs} runs · ${owner.failed} failed · ${owner.warning || 0} warning</span>
           </span>
-          <span class="pill ${owner.failed ? "failed" : owner.noRuns ? "unknown" : "succeeded"}">${escapeHtml(formatTokens(owner.tokens))}</span>
+          <span class="pill ${owner.failed ? "failed" : owner.warning ? "warning" : owner.noRuns ? "unknown" : "succeeded"}">${escapeHtml(formatTokens(owner.tokens))}</span>
         </button>
       `).join("")}
     </div>
@@ -277,6 +278,7 @@ function renderOwnerInsights(owners) {
 function renderReliabilityRows(insights) {
   const rows = [
     ...insights.failures.map((job) => ({ job, tone: "failed", detail: `${job.analytics.failed} failures · last ${formatDateTime(job.analytics.lastFailureAt)}` })),
+    ...(insights.warnings || []).map((job) => ({ job, tone: "warning", detail: `${job.analytics.warning} warning${job.analytics.warning === 1 ? "" : "s"} · last ${formatDateTime(job.analytics.lastWarningAt)}` })),
     ...insights.recovered.map((job) => ({ job, tone: "warning", detail: `Recovered after ${job.analytics.failed} recent failure${job.analytics.failed === 1 ? "" : "s"}` })),
     ...insights.noRuns.map((job) => ({ job, tone: "unknown", detail: "No recorded run history" })),
     ...insights.stale.map((job) => ({ job, tone: "warning", detail: `Last run ${formatDateTime(job.analytics.lastRunAt)}` })),
@@ -781,6 +783,14 @@ function summarizeRun(job, run) {
     };
   }
 
+  if (status === "warning") {
+    return {
+      headline: "The selected run completed with a warning.",
+      detail: run.summary || firstLine(run.stderr) || "OpenClaw recorded a successful wrapper run, but the result needs attention.",
+      cause: deriveCause(run),
+    };
+  }
+
   if (status === "succeeded") {
     return {
       headline: "The selected run completed successfully.",
@@ -808,6 +818,7 @@ function deriveCause(run) {
   const text = `${run?.stderr || ""}\n${run?.summary || ""}\n${run?.deliveryStatus || ""}`.toLowerCase();
   if (text.includes("timed out") || text.includes("timeout")) return "Run timed out";
   if (text.includes("requires target")) return "Delivery target missing";
+  if (text.includes("auth") || text.includes("unauthorized")) return "Authentication problem";
   if (text.includes("not-delivered")) return "Delivery did not complete";
   if (text.includes("permission")) return "Permission or access problem";
   if (text.includes("network") || text.includes("connection")) return "Network or connection problem";
@@ -866,11 +877,13 @@ function scopedInsights(jobs, events) {
   const runs = jobs.reduce((sum, job) => sum + (job.analytics?.runs || 0), 0);
   const succeeded = jobs.reduce((sum, job) => sum + (job.analytics?.succeeded || 0), 0);
   const failed = jobs.reduce((sum, job) => sum + (job.analytics?.failed || 0), 0);
+  const warning = jobs.reduce((sum, job) => sum + (job.analytics?.warning || 0), 0);
   const delivered = jobs.reduce((sum, job) => sum + (job.analytics?.delivery?.delivered || 0), 0);
   const notDelivered = jobs.reduce((sum, job) => sum + (job.analytics?.delivery?.["not-delivered"] || 0), 0);
   const durations = jobs.flatMap((job) => [job.analytics?.durationMs?.p50, job.analytics?.durationMs?.p90, job.analytics?.durationMs?.p99, job.analytics?.durationMs?.max]).map(Number).filter((value) => Number.isFinite(value) && value >= 0).sort((a, b) => a - b);
   const totalTokens = jobs.reduce((sum, job) => sum + (job.analytics?.usage?.totalTokens || 0), 0);
   const failures = jobs.filter((job) => job.analytics?.failed > 0).sort((a, b) => b.analytics.failed - a.analytics.failed);
+  const warnings = jobs.filter((job) => job.analytics?.warning > 0).sort((a, b) => b.analytics.warning - a.analytics.warning);
   const recovered = jobs.filter((job) => job.analytics?.recovered);
   const noRuns = jobs.filter((job) => job.analytics?.noRuns);
   const stale = jobs.filter((job) => job.analytics?.stale);
@@ -896,6 +909,7 @@ function scopedInsights(jobs, events) {
     runs,
     succeeded,
     failed,
+    warning,
     successRate: runs ? succeeded / runs : null,
     delivered,
     notDelivered,
@@ -907,6 +921,7 @@ function scopedInsights(jobs, events) {
     avgTokens: runs ? Math.round(totalTokens / runs) : null,
     owners: scopedOwnerInsights(jobs),
     failures,
+    warnings,
     recovered,
     noRuns,
     stale,
@@ -922,12 +937,13 @@ function scopedOwnerInsights(jobs) {
   jobs.forEach((job) => {
     const owner = jobOwner(job);
     if (!owners.has(owner.key)) {
-      owners.set(owner.key, { key: owner.key, label: owner.label, jobs: 0, runs: 0, failed: 0, recovered: 0, noRuns: 0, tokens: 0 });
+      owners.set(owner.key, { key: owner.key, label: owner.label, jobs: 0, runs: 0, failed: 0, warning: 0, recovered: 0, noRuns: 0, tokens: 0 });
     }
     const row = owners.get(owner.key);
     row.jobs += 1;
     row.runs += job.analytics?.runs || 0;
     row.failed += job.analytics?.failed || 0;
+    row.warning += job.analytics?.warning || 0;
     row.recovered += job.analytics?.recovered ? 1 : 0;
     row.noRuns += job.analytics?.noRuns ? 1 : 0;
     row.tokens += job.analytics?.usage?.totalTokens || 0;
@@ -961,6 +977,7 @@ function scopedScheduleInsights(events) {
 function jobFlags(job) {
   const flags = [];
   if (job.analytics?.failed) flags.push({ label: `${job.analytics.failed} recent fail`, tone: "failed" });
+  if (job.analytics?.warning) flags.push({ label: `${job.analytics.warning} warning`, tone: "warning" });
   if (job.analytics?.recovered) flags.push({ label: "recovered", tone: "warning" });
   if (job.analytics?.noRuns) flags.push({ label: "no runs", tone: "unknown" });
   if (job.analytics?.stale) flags.push({ label: "stale", tone: "warning" });
@@ -1037,10 +1054,11 @@ function ownerFilters() {
 
 function ownerSummary(jobs) {
   const counts = countStatuses(jobs);
-  const status = counts.failed ? "failed" : counts.running ? "running" : counts.unknown ? "unknown" : counts.succeeded ? "succeeded" : "skipped";
+  const status = counts.failed ? "failed" : counts.running ? "running" : counts.warning ? "warning" : counts.unknown ? "unknown" : counts.succeeded ? "succeeded" : "skipped";
   const detailParts = [`${counts.total} ${pluralize("job", counts.total)}`];
   if (counts.failed) detailParts.push(`${counts.failed} failed`);
   if (counts.running) detailParts.push(`${counts.running} running`);
+  if (counts.warning) detailParts.push(`${counts.warning} warning`);
   return {
     count: counts.total,
     status,
@@ -1056,7 +1074,7 @@ function countStatuses(jobs) {
       counts[status] = (counts[status] || 0) + 1;
       return counts;
     },
-    { total: 0, running: 0, succeeded: 0, failed: 0, skipped: 0, unknown: 0 },
+    { total: 0, running: 0, succeeded: 0, failed: 0, warning: 0, skipped: 0, unknown: 0 },
   );
 }
 

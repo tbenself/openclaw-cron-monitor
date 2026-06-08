@@ -8,6 +8,7 @@ The monitor reads local OpenClaw cron files, projects upcoming cron occurrences 
 
 ## Recent Changes
 
+- Classifies successful wrapper runs with auth, permission, timeout, exception, or other blocker text as warnings so cron jobs with failed business outcomes no longer appear healthy green.
 - Added an Owner / Session filter so jobs can be scoped by bot, session, or isolated cron ownership.
 - Health counts, the job list, the calendar, and the runs table now update together when owner, status, or search filters are active.
 - Added an Insights view with 14-day reliability, recovered-failure warnings, delivery audit, schedule load, duration and token outliers, owner summaries, archived run-history checks, and browser-local UI activity counters.

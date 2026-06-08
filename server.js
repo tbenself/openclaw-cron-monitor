@@ -2,12 +2,15 @@
 import { createServer } from "node:http";
 import { readFile, readdir, stat } from "node:fs/promises";
 import { createReadStream, realpathSync } from "node:fs";
+import { execFile } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import os from "node:os";
+import { promisify } from "node:util";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.join(__dirname, "public");
+const execFileAsync = promisify(execFile);
 const port = Number(process.env.PORT || 3817);
 const host = process.env.HOST || "127.0.0.1";
 const networkLabel = process.env.OPENCLAW_MONITOR_NETWORK_LABEL || "Private network";
@@ -18,6 +21,7 @@ const cronDir = expandHome(process.env.OPENCLAW_CRON_DIR || "~/.openclaw/cron");
 const jobsPath = process.env.OPENCLAW_JOBS_PATH || path.join(cronDir, "jobs.json");
 const statePath = process.env.OPENCLAW_STATE_PATH || deriveStatePath(jobsPath);
 const runsDir = process.env.OPENCLAW_RUNS_DIR || path.join(cronDir, "runs");
+const taskRunsPath = process.env.OPENCLAW_TASK_RUNS_PATH || path.join(path.dirname(cronDir), "tasks", "runs.sqlite");
 
 const mimeTypes = {
   ".html": "text/html; charset=utf-8",
@@ -75,9 +79,11 @@ export async function loadOverview() {
   const source = await loadOpenClawData();
   const analyticsWindowStart = Date.now() - analyticsWindowDays * 24 * 60 * 60 * 1000;
   const jobs = source.jobs.map((job) => normalizeJob(job, source.state));
+  const resolvedTaskRunsPath = await resolveExistingPath(taskRunsPath);
+  const taskRunsByJob = await loadTaskRunsForJobs(jobs.map((job) => job.id), 250, resolvedTaskRunsPath);
   const jobsWithRuns = await Promise.all(
     jobs.map(async (job) => {
-      const runs = await loadRuns(job.id, 250);
+      const runs = await loadRuns(job.id, 250, taskRunsByJob.get(job.id) || []);
       const lastRun = runs[0] || null;
       const analytics = jobAnalytics(job, runs, analyticsWindowStart);
       return {
@@ -105,7 +111,7 @@ export async function loadOverview() {
   return {
     generatedAt: new Date().toISOString(),
     source: source.kind,
-    paths: { jobsPath: source.paths?.jobsPath || jobsPath, statePath: source.paths?.statePath || statePath, runsDir },
+    paths: { jobsPath: source.paths?.jobsPath || jobsPath, statePath: source.paths?.statePath || statePath, runsDir, taskRunsPath: resolvedTaskRunsPath },
     host: hostLabel,
     networkLabel,
     jobs: jobsWithRuns,
@@ -217,14 +223,111 @@ function deriveJobStatus(job, state, lastRun) {
   return "unknown";
 }
 
-export async function loadRuns(jobId, limit = 50) {
+export async function loadRuns(jobId, limit = 50, taskRuns = null) {
   const filePath = await resolveExistingPath(path.join(runsDir, `${jobId}.jsonl`));
+  const taskBoardRuns = taskRuns || (await loadTaskRunsForJobs([jobId], limit)).get(jobId) || [];
   try {
     const text = await readFile(filePath, "utf8");
-    return parseRunLines(text, jobId).slice(0, limit);
+    return mergeRuns(parseRunLines(text, jobId), taskBoardRuns).slice(0, limit);
   } catch {
-    return sampleRuns[jobId]?.slice(0, limit) || [];
+    return mergeRuns(taskBoardRuns, sampleRuns[jobId] || []).slice(0, limit);
   }
+}
+
+async function loadTaskRunsForJobs(jobIds, perJobLimit = 50, storePath = taskRunsPath) {
+  const ids = [...new Set((jobIds || []).filter(Boolean).map(String))];
+  if (!ids.length) return new Map();
+
+  const resolvedPath = await resolveExistingPath(storePath);
+  try {
+    const info = await stat(resolvedPath);
+    if (!info.isFile()) return new Map();
+  } catch {
+    return new Map();
+  }
+
+  const rowLimit = Math.max(ids.length, ids.length * Math.max(1, Number(perJobLimit) || 50));
+  const sql = `
+    select
+      task_id, source_id, owner_key, agent_id, run_id, label, status, delivery_status,
+      created_at, started_at, ended_at, last_event_at, error, progress_summary,
+      terminal_summary, terminal_outcome, child_session_key
+    from task_runs
+    where source_id in (${ids.map(sqlString).join(",")})
+    order by coalesce(ended_at, last_event_at, started_at, created_at) desc
+    limit ${rowLimit};
+  `;
+
+  try {
+    const { stdout } = await execFileAsync("sqlite3", ["-json", resolvedPath, sql], { timeout: 5000, maxBuffer: 5 * 1024 * 1024 });
+    const rows = JSON.parse(stdout || "[]");
+    const byJob = new Map();
+    rows.forEach((row, index) => {
+      const run = normalizeTaskRun(row, index);
+      if (!run) return;
+      const bucket = byJob.get(run.jobId) || [];
+      if (bucket.length < perJobLimit) bucket.push(run);
+      byJob.set(run.jobId, bucket);
+    });
+    return byJob;
+  } catch {
+    return new Map();
+  }
+}
+
+function normalizeTaskRun(row, index) {
+  if (!row?.source_id) return null;
+  const startedAt = msToIso(row.started_at) || msToIso(row.created_at) || msToIso(row.last_event_at);
+  const endedAt = msToIso(row.ended_at) || msToIso(row.last_event_at);
+  const summary = row.terminal_summary || row.progress_summary || row.terminal_outcome || row.label || "";
+  return {
+    id: String(row.run_id || row.task_id || `${row.source_id}-task-${row.started_at || row.created_at || index}`),
+    taskId: row.task_id || "",
+    jobId: String(row.source_id),
+    status: normalizeRunStatus(row.status || row.terminal_outcome),
+    exitCode: null,
+    startedAt,
+    endedAt,
+    durationMs: calculateDurationMs(startedAt, endedAt),
+    summary,
+    stdout: "",
+    stderr: stringifyLog(row.error || ""),
+    delivery: {},
+    deliveryStatus: row.delivery_status || "",
+    delivered: null,
+    sessionKey: row.child_session_key || "",
+    model: "",
+    provider: "",
+    usage: null,
+    nextRunAt: null,
+    raw: {
+      task_id: row.task_id,
+      source_id: row.source_id,
+      run_id: row.run_id,
+      label: row.label,
+      status: row.status,
+      delivery_status: row.delivery_status,
+      created_at: row.created_at,
+      started_at: row.started_at,
+      ended_at: row.ended_at,
+      last_event_at: row.last_event_at,
+      terminal_outcome: row.terminal_outcome,
+    },
+  };
+}
+
+function mergeRuns(...runSets) {
+  const seen = new Set();
+  return runSets
+    .flat()
+    .filter(Boolean)
+    .filter((run) => {
+      const key = `${run.jobId || ""}|${run.startedAt || run.endedAt || ""}|${run.status || ""}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .sort((a, b) => Date.parse(b.startedAt || b.endedAt || 0) - Date.parse(a.startedAt || a.endedAt || 0));
 }
 
 function parseRunLines(text, jobId) {
@@ -274,7 +377,7 @@ function normalizeRun(run, jobId, index) {
 
 function normalizeRunStatus(status) {
   const normalized = String(status || "unknown").toLowerCase();
-  if (["success", "ok", "completed"].includes(normalized)) return "succeeded";
+  if (["success", "ok", "completed", "complete"].includes(normalized)) return "succeeded";
   if (["error"].includes(normalized)) return "failed";
   return normalized;
 }
@@ -783,6 +886,10 @@ async function resolveExistingPath(filePath) {
     }
   }
   return filePath;
+}
+
+function sqlString(value) {
+  return `'${String(value).replaceAll("'", "''")}'`;
 }
 
 function sendJson(res, value, status = 200) {

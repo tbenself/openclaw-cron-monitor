@@ -40,13 +40,13 @@ http://localhost:3817
 From npm:
 
 ```bash
-pi install npm:openclaw-cron-monitor@0.1.2
+pi install npm:openclaw-cron-monitor@0.1.3
 ```
 
 From a git repository:
 
 ```bash
-pi install git:github.com/<your-github-username>/openclaw-cron-monitor@v0.1.2
+pi install git:github.com/<your-github-username>/openclaw-cron-monitor@v0.1.3
 ```
 
 From a local checkout:
@@ -81,12 +81,13 @@ Defaults:
 - `OPENCLAW_JOBS_PATH=$OPENCLAW_CRON_DIR/jobs.json`
 - `OPENCLAW_STATE_PATH=$OPENCLAW_CRON_DIR/jobs-state.json`
 - `OPENCLAW_RUNS_DIR=$OPENCLAW_CRON_DIR/runs`
+- `OPENCLAW_TASK_RUNS_PATH=~/.openclaw/tasks/runs.sqlite`
 - `HOST=127.0.0.1`
 - `PORT=3817`
 - `OPENCLAW_MONITOR_NETWORK_LABEL=Private network`
 - `OPENCLAW_MONITOR_HOST_LABEL=<system hostname>`
 
-The monitor automatically falls back to OpenClaw's migrated store names when present, including `jobs.json.migrated`, `jobs-state.json.migrated`, and `runs/*.jsonl.migrated`.
+The monitor automatically falls back to OpenClaw's migrated store names when present, including `jobs.json.migrated`, `jobs-state.json.migrated`, `runs/*.jsonl.migrated`, and `tasks/runs.sqlite.migrated`. When the task run database is available, completed task-board runs are merged into matching cron jobs by `source_id`.
 
 Example:
 

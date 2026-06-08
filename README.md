@@ -40,13 +40,13 @@ http://localhost:3817
 From npm:
 
 ```bash
-pi install npm:openclaw-cron-monitor@0.1.4
+pi install npm:openclaw-cron-monitor@0.1.5
 ```
 
 From a git repository:
 
 ```bash
-pi install git:github.com/<your-github-username>/openclaw-cron-monitor@v0.1.4
+pi install git:github.com/<your-github-username>/openclaw-cron-monitor@v0.1.5
 ```
 
 From a local checkout:

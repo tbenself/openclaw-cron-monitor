@@ -400,13 +400,13 @@ function buildEvents(job) {
     kind: "run",
   }));
 
-  const scheduledEvents = projectScheduledEvents(job);
+  const scheduledEvents = projectScheduledEvents(job, job.recentRuns);
   if (!scheduledEvents.length && job.nextRunAt) {
     scheduledEvents.push({
       id: `${job.id}-next`,
       jobId: job.id,
       jobName: job.name,
-      status: job.status || "unknown",
+      status: "unknown",
       startedAt: job.nextRunAt,
       endedAt: null,
       durationMs: job.typicalDurationMs,
@@ -723,14 +723,14 @@ function mergeCounts(items) {
   }, {});
 }
 
-function projectScheduledEvents(job) {
+function projectScheduledEvents(job, runs = []) {
   if (!job.enabled || job.schedule.kind !== "cron" || !job.schedule.expr) return [];
   const cron = parseCronExpression(job.schedule.expr);
   if (!cron) return [];
 
   const now = new Date();
   const weekStart = startOfWeek(now);
-  const windowStart = new Date(Math.max(now.getTime(), weekStart.getTime()));
+  const windowStart = new Date(weekStart);
   const windowEnd = new Date(weekStart);
   windowEnd.setDate(windowEnd.getDate() + 14);
 
@@ -745,11 +745,12 @@ function projectScheduledEvents(job) {
         if (candidate < windowStart || candidate >= windowEnd) continue;
         if (!cron.months.has(candidate.getMonth() + 1)) continue;
         if (!cronDayMatches(cron, candidate)) continue;
+        if (hasRecordedRunNear(candidate, runs)) continue;
         events.push({
           id: `${job.id}-scheduled-${candidate.getTime()}`,
           jobId: job.id,
           jobName: job.name,
-          status: job.status || "unknown",
+          status: candidate < now ? job.status || "unknown" : "unknown",
           startedAt: candidate.toISOString(),
           endedAt: null,
           durationMs: job.typicalDurationMs,
@@ -760,6 +761,16 @@ function projectScheduledEvents(job) {
   }
 
   return events;
+}
+
+function hasRecordedRunNear(candidate, runs) {
+  const candidateMs = candidate.getTime();
+  return (runs || []).some((run) => {
+    const startedMs = Date.parse(run?.startedAt || "");
+    if (!Number.isFinite(startedMs)) return false;
+    const toleranceMs = Math.max(10 * 60 * 1000, Number(run.durationMs || 0) + 2 * 60 * 1000);
+    return Math.abs(startedMs - candidateMs) <= toleranceMs;
+  });
 }
 
 function startOfWeek(date) {

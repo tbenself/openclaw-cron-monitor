@@ -711,6 +711,7 @@ function selectedRun(job) {
   if (recordedRun) return recordedRun;
   const projectedEvent = data?.events.find((event) => event.jobId === job.id && event.id === selectedRunId && event.kind !== "run");
   if (projectedEvent) {
+    const isPastProjected = Date.parse(projectedEvent.startedAt || "") < Date.now();
     return {
       id: projectedEvent.id,
       taskId: "",
@@ -719,11 +720,13 @@ function selectedRun(job) {
       startedAt: projectedEvent.startedAt,
       endedAt: null,
       durationMs: projectedEvent.durationMs,
-      summary: "Scheduled occurrence. No run output has been recorded yet.",
+      summary: isPastProjected
+        ? "Projected past occurrence. Status is inferred from the latest job health because no matching run record is available."
+        : "Scheduled occurrence. No run output has been recorded yet.",
       stdout: "",
       stderr: "",
       deliveryStatus: "not-requested",
-      kind: projectedEvent.kind,
+      kind: isPastProjected ? "projected" : projectedEvent.kind,
       raw: projectedEvent,
     };
   }
@@ -741,6 +744,14 @@ function summarizeRun(job, run) {
       headline: "No run has been recorded yet.",
       detail: "OpenClaw knows about this job, but there is no run history for the selected window.",
       cause: "Waiting for first recorded run",
+    };
+  }
+
+  if (run.kind === "projected") {
+    return {
+      headline: "No matching run record is available for this past occurrence.",
+      detail: run.summary,
+      cause: "Inferred from latest job health",
     };
   }
 

@@ -1,6 +1,6 @@
 {
   "name": "openclaw-cron-monitor",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "Read-only web dashboard for OpenClaw cron jobs and recurring task runs.",
   "license": "MIT",
   "type": "module",

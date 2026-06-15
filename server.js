@@ -22,6 +22,7 @@ const jobsPath = process.env.OPENCLAW_JOBS_PATH || path.join(cronDir, "jobs.json
 const statePath = process.env.OPENCLAW_STATE_PATH || deriveStatePath(jobsPath);
 const runsDir = process.env.OPENCLAW_RUNS_DIR || path.join(cronDir, "runs");
 const taskRunsPath = process.env.OPENCLAW_TASK_RUNS_PATH || path.join(path.dirname(cronDir), "tasks", "runs.sqlite");
+const openClawStateDbPath = process.env.OPENCLAW_STATE_DB_PATH || path.join(path.dirname(cronDir), "state", "openclaw.sqlite");
 
 const mimeTypes = {
   ".html": "text/html; charset=utf-8",
@@ -80,10 +81,12 @@ export async function loadOverview() {
   const analyticsWindowStart = Date.now() - analyticsWindowDays * 24 * 60 * 60 * 1000;
   const jobs = source.jobs.map((job) => normalizeJob(job, source.state));
   const resolvedTaskRunsPath = await resolveExistingPath(taskRunsPath);
+  const resolvedStateDbPath = await resolveExistingPath(openClawStateDbPath);
   const taskRunsByJob = await loadTaskRunsForJobs(jobs.map((job) => job.id), 250, resolvedTaskRunsPath);
+  const cronRunsByJob = await loadCronRunLogsForJobs(jobs.map((job) => job.id), 250, resolvedStateDbPath);
   const jobsWithRuns = await Promise.all(
     jobs.map(async (job) => {
-      const runs = await loadRuns(job.id, 250, taskRunsByJob.get(job.id) || []);
+      const runs = await loadRuns(job.id, 250, taskRunsByJob.get(job.id) || [], cronRunsByJob.get(job.id) || []);
       const lastRun = runs[0] || null;
       const analytics = jobAnalytics(job, runs, analyticsWindowStart);
       return {
@@ -111,7 +114,7 @@ export async function loadOverview() {
   return {
     generatedAt: new Date().toISOString(),
     source: source.kind,
-    paths: { jobsPath: source.paths?.jobsPath || jobsPath, statePath: source.paths?.statePath || statePath, runsDir, taskRunsPath: resolvedTaskRunsPath },
+    paths: { jobsPath: source.paths?.jobsPath || jobsPath, statePath: source.paths?.statePath || statePath, runsDir, taskRunsPath: resolvedTaskRunsPath, openClawStateDbPath: source.paths?.openClawStateDbPath || resolvedStateDbPath },
     host: hostLabel,
     networkLabel,
     jobs: jobsWithRuns,
@@ -122,6 +125,11 @@ export async function loadOverview() {
 }
 
 async function loadOpenClawData() {
+  const sqliteSource = await loadOpenClawSqliteData(openClawStateDbPath);
+  if (sqliteSource.jobs.length > 0) {
+    return sqliteSource;
+  }
+
   try {
     const jobsRead = await readJsonResolved(jobsPath);
     const stateRead = await readJsonResolved(statePath).catch(() => ({ data: {}, path: statePath }));
@@ -136,6 +144,111 @@ async function loadOpenClawData() {
   }
 
   return sampleData();
+}
+
+async function loadOpenClawSqliteData(storePath) {
+  const resolvedPath = await resolveExistingPath(storePath);
+  try {
+    const info = await stat(resolvedPath);
+    if (!info.isFile()) return { kind: "openclaw", jobs: [], state: {}, paths: { openClawStateDbPath: resolvedPath } };
+  } catch {
+    return { kind: "openclaw", jobs: [], state: {}, paths: { openClawStateDbPath: resolvedPath } };
+  }
+
+  const sql = `
+    select
+      job_id, name, description, enabled, delete_after_run, created_at_ms, agent_id,
+      session_key, schedule_kind, schedule_expr, schedule_tz, every_ms, anchor_ms, at,
+      stagger_ms, session_target, wake_mode, payload_kind, payload_message,
+      payload_model, payload_fallbacks_json, payload_thinking, payload_timeout_seconds,
+      payload_light_context, payload_tools_allow_json, delivery_mode, delivery_channel,
+      delivery_to, failure_delivery_mode, failure_delivery_channel, failure_delivery_to,
+      next_run_at_ms, running_at_ms, last_run_at_ms, last_run_status, last_error,
+      last_duration_ms, consecutive_errors, consecutive_skipped, last_delivery_status,
+      last_delivery_error, last_delivered, job_json, state_json
+    from cron_jobs
+    order by sort_order asc, name asc;
+  `;
+
+  try {
+    const { stdout } = await execFileAsync("sqlite3", ["-json", resolvedPath, sql], { timeout: 5000, maxBuffer: 20 * 1024 * 1024 });
+    const rows = JSON.parse(stdout || "[]");
+    const jobs = [];
+    const state = {};
+    rows.forEach((row) => {
+      const job = normalizeSqliteCronJob(row);
+      if (!job?.id) return;
+      jobs.push(job);
+      state[job.id] = normalizeSqliteCronState(row);
+    });
+    return { kind: "openclaw-sqlite", jobs, state, paths: { openClawStateDbPath: resolvedPath } };
+  } catch {
+    return { kind: "openclaw", jobs: [], state: {}, paths: { openClawStateDbPath: resolvedPath } };
+  }
+}
+
+function normalizeSqliteCronJob(row) {
+  const parsed = parseJsonObject(row.job_json);
+  const payload = parsed.payload && typeof parsed.payload === "object" ? parsed.payload : {};
+  const delivery = parsed.delivery && typeof parsed.delivery === "object" ? parsed.delivery : {};
+  return {
+    ...parsed,
+    id: parsed.id || row.job_id,
+    jobId: row.job_id,
+    name: parsed.name || row.name || row.job_id,
+    description: parsed.description || row.description || "",
+    enabled: Boolean(row.enabled),
+    agentId: parsed.agentId || row.agent_id || "",
+    sessionKey: parsed.sessionKey || row.session_key || "",
+    sessionTarget: parsed.sessionTarget || row.session_target || "",
+    wakeMode: parsed.wakeMode || row.wake_mode || "",
+    schedule: {
+      ...(parsed.schedule || {}),
+      kind: parsed.schedule?.kind || row.schedule_kind || "cron",
+      expr: parsed.schedule?.expr || row.schedule_expr || "",
+      tz: parsed.schedule?.tz || row.schedule_tz || "",
+      everyMs: parsed.schedule?.everyMs ?? row.every_ms ?? null,
+      at: parsed.schedule?.at || row.at || null,
+      staggerMs: parsed.schedule?.staggerMs ?? row.stagger_ms ?? null,
+    },
+    payload: {
+      ...payload,
+      kind: payload.kind || row.payload_kind || "",
+      message: payload.message || row.payload_message || "",
+      model: payload.model || row.payload_model || "",
+      thinking: payload.thinking || row.payload_thinking || "",
+      timeoutSeconds: payload.timeoutSeconds ?? row.payload_timeout_seconds ?? null,
+      lightContext: payload.lightContext ?? row.payload_light_context ?? null,
+      tools: payload.tools || parseJsonArray(row.payload_tools_allow_json),
+    },
+    delivery: {
+      ...delivery,
+      mode: delivery.mode || row.delivery_mode || "",
+      channel: delivery.channel || row.delivery_channel || "",
+      to: delivery.to || row.delivery_to || "",
+      failureDestination: delivery.failureDestination || row.failure_delivery_to || "",
+    },
+  };
+}
+
+function normalizeSqliteCronState(row) {
+  const parsed = parseJsonObject(row.state_json);
+  return {
+    ...parsed,
+    running: Boolean(row.running_at_ms || parsed.running),
+    activeRunId: parsed.activeRunId || null,
+    nextRunAtMs: row.next_run_at_ms ?? parsed.nextRunAtMs ?? null,
+    lastRunAtMs: row.last_run_at_ms ?? parsed.lastRunAtMs ?? null,
+    lastRunStatus: row.last_run_status || parsed.lastRunStatus || "",
+    lastStatus: row.last_run_status || parsed.lastStatus || "",
+    lastError: row.last_error || parsed.lastError || "",
+    lastDurationMs: row.last_duration_ms ?? parsed.lastDurationMs ?? null,
+    consecutiveErrors: row.consecutive_errors ?? parsed.consecutiveErrors ?? 0,
+    consecutiveSkipped: row.consecutive_skipped ?? parsed.consecutiveSkipped ?? 0,
+    lastDeliveryStatus: row.last_delivery_status || parsed.lastDeliveryStatus || "",
+    lastDeliveryError: row.last_delivery_error || parsed.lastDeliveryError || "",
+    lastDelivered: row.last_delivered === 1 ? true : row.last_delivered === 0 ? false : parsed.lastDelivered,
+  };
 }
 
 function extractJobs(raw) {
@@ -224,15 +337,98 @@ function deriveJobStatus(job, state, lastRun) {
   return "unknown";
 }
 
-export async function loadRuns(jobId, limit = 50, taskRuns = null) {
+export async function loadRuns(jobId, limit = 50, taskRuns = null, cronLogRuns = null) {
   const filePath = await resolveExistingPath(path.join(runsDir, `${jobId}.jsonl`));
   const taskBoardRuns = taskRuns || (await loadTaskRunsForJobs([jobId], limit)).get(jobId) || [];
+  const sqliteCronRuns = cronLogRuns || (await loadCronRunLogsForJobs([jobId], limit)).get(jobId) || [];
   try {
     const text = await readFile(filePath, "utf8");
-    return mergeRuns(parseRunLines(text, jobId), taskBoardRuns).slice(0, limit);
+    return mergeRuns(parseRunLines(text, jobId), sqliteCronRuns, taskBoardRuns).slice(0, limit);
   } catch {
-    return mergeRuns(taskBoardRuns, sampleRuns[jobId] || []).slice(0, limit);
+    return mergeRuns(sqliteCronRuns, taskBoardRuns, sampleRuns[jobId] || []).slice(0, limit);
   }
+}
+
+async function loadCronRunLogsForJobs(jobIds, perJobLimit = 50, storePath = openClawStateDbPath) {
+  const ids = [...new Set((jobIds || []).filter(Boolean).map(String))];
+  if (!ids.length) return new Map();
+
+  const resolvedPath = await resolveExistingPath(storePath);
+  try {
+    const info = await stat(resolvedPath);
+    if (!info.isFile()) return new Map();
+  } catch {
+    return new Map();
+  }
+
+  const rowLimit = Math.max(ids.length, ids.length * Math.max(1, Number(perJobLimit) || 50));
+  const sql = `
+    select
+      job_id, seq, ts, status, error, summary, diagnostics_summary, delivery_status,
+      delivery_error, delivered, session_id, session_key, run_id, run_at_ms,
+      duration_ms, next_run_at_ms, model, provider, total_tokens, entry_json
+    from cron_run_logs
+    where job_id in (${ids.map(sqlString).join(",")})
+    order by coalesce(run_at_ms, ts, created_at) desc, seq desc
+    limit ${rowLimit};
+  `;
+
+  try {
+    const { stdout } = await execFileAsync("sqlite3", ["-json", resolvedPath, sql], { timeout: 5000, maxBuffer: 20 * 1024 * 1024 });
+    const rows = JSON.parse(stdout || "[]");
+    const byJob = new Map();
+    rows.forEach((row, index) => {
+      const run = normalizeSqliteCronRun(row, index);
+      if (!run) return;
+      const bucket = byJob.get(run.jobId) || [];
+      if (bucket.length < perJobLimit) bucket.push(run);
+      byJob.set(run.jobId, bucket);
+    });
+    return byJob;
+  } catch {
+    return new Map();
+  }
+}
+
+function normalizeSqliteCronRun(row, index) {
+  if (!row?.job_id) return null;
+  const raw = parseJsonObject(row.entry_json);
+  const startedAt = msToIso(row.run_at_ms) || msToIso(raw.runAtMs) || msToIso(row.ts) || null;
+  const endedAt = msToIso(addMs(row.run_at_ms || raw.runAtMs, row.duration_ms || raw.durationMs)) || msToIso(row.ts) || null;
+  const summary = row.summary || raw.summary || row.diagnostics_summary || "";
+  const stderr = stringifyLog(row.error || raw.error || row.delivery_error || "");
+  const deliveryStatus = row.delivery_status || raw.deliveryStatus || (row.delivered === 1 ? "delivered" : row.delivered === 0 ? "not-delivered" : "");
+  const status = classifyRunOutcome(normalizeRunStatus(row.status || raw.status), {
+    summary,
+    stderr,
+    deliveryStatus,
+    raw,
+  });
+
+  return {
+    id: String(row.run_id || raw.runId || raw.id || `${row.job_id}-sqlite-${row.run_at_ms || row.ts || row.seq || index}`),
+    taskId: "",
+    jobId: String(row.job_id),
+    status,
+    exitCode: raw.exitCode ?? null,
+    startedAt,
+    endedAt,
+    durationMs: row.duration_ms ?? raw.durationMs ?? calculateDurationMs(startedAt, endedAt),
+    summary,
+    stdout: raw.stdout || "",
+    stderr,
+    delivery: raw.delivery || {},
+    deliveryStatus,
+    delivered: row.delivered === 1 ? true : row.delivered === 0 ? false : raw.delivered ?? null,
+    sessionKey: row.session_key || raw.sessionKey || "",
+    model: row.model || raw.model || "",
+    provider: row.provider || raw.provider || "",
+    usage: normalizeUsage({
+      totalTokens: row.total_tokens ?? raw.usage?.totalTokens ?? raw.usage?.total_tokens,
+    }),
+    nextRunAt: msToIso(row.next_run_at_ms || raw.nextRunAtMs),
+    raw: raw && Object.keys(raw).length ? raw : row,
+  };
 }
 
 async function loadTaskRunsForJobs(jobIds, perJobLimit = 50, storePath = taskRunsPath) {
@@ -970,6 +1166,26 @@ async function resolveExistingPath(filePath) {
 
 function sqlString(value) {
   return `'${String(value).replaceAll("'", "''")}'`;
+}
+
+function parseJsonObject(value) {
+  if (!value || typeof value !== "string") return {};
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function parseJsonArray(value) {
+  if (!value || typeof value !== "string") return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
 }
 
 function sendJson(res, value, status = 200) {

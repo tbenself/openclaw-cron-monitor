@@ -8,6 +8,7 @@ The monitor reads local OpenClaw cron files, projects upcoming cron occurrences 
 
 ## Recent Changes
 
+- Reads OpenClaw's authoritative SQLite cron store and run-log table, while keeping the legacy JSON files as a fallback, so newly created current cron jobs appear in the monitor.
 - Classifies successful wrapper runs with auth, permission, timeout, exception, or other blocker text as warnings so cron jobs with failed business outcomes no longer appear healthy green.
 - Added an Owner / Session filter so jobs can be scoped by bot, session, or isolated cron ownership.
 - Health counts, the job list, the calendar, and the runs table now update together when owner, status, or search filters are active.
